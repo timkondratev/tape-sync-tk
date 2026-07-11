@@ -1,14 +1,15 @@
 use std::env;
+use std::io::{self, Write};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::DeviceTrait;
 use tape_sync_tk::audio::AudioRuntime;
 use tape_sync_tk::cli::CliArgs;
-use tape_sync_tk::config::AppConfig;
+use tape_sync_tk::config::{AppConfig, Mode};
 use tape_sync_tk::runtime::initialize;
 
 fn main() {
@@ -54,20 +55,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.mode, runtime.report.total_latency_ms
     );
 
-    if let Some(status) = runtime.decode_status_snapshot() {
-        println!(
-            "decode status: lock={:?}, direction={:?}, decoded_frames={}, measured_fps={:?}, smoothed_tempo_bpm={:?}",
-            status.lock_status,
-            status.direction,
-            status.decoded_frame_count,
-            status.measured_fps,
-            status.smoothed_tempo_bpm
-        );
+    println!("running {:?} mode; press Ctrl-C to stop", config.mode);
+    if matches!(config.mode, Mode::Decode) {
+        wait_for_shutdown_with_status(&runtime)?;
+    } else {
+        wait_for_shutdown()?;
     }
 
-    println!("running {:?} mode; press Ctrl-C to stop", config.mode);
-    wait_for_shutdown()?;
-
+    println!();
     drop(runtime);
     println!("shutdown complete for {:?} mode", config.mode);
     Ok(())
@@ -86,5 +81,59 @@ fn wait_for_shutdown() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn wait_for_shutdown_with_status(
+    runtime: &tape_sync_tk::runtime::StartupRuntime,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&shutdown_requested);
+
+    ctrlc::set_handler(move || {
+        handler_flag.store(true, Ordering::SeqCst);
+    })?;
+
+    let redraw_interval = Duration::from_millis(200);
+    let mut last_draw = Instant::now() - redraw_interval;
+    let mut last_status = None;
+    while !shutdown_requested.load(Ordering::SeqCst) {
+        if let Some(status) = runtime.decode_status_snapshot() {
+            let changed = last_status.as_ref() != Some(&status);
+            if changed && last_draw.elapsed() >= redraw_interval {
+                // Clear current line before redrawing to avoid wrapped/leftover text artifacts.
+                print!("\r\x1b[2K{}", render_status_line(&status));
+                io::stdout().flush()?;
+                last_status = Some(status);
+                last_draw = Instant::now();
+            }
+        }
+
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    Ok(())
+}
+
+fn render_status_line(status: &tape_sync_tk::ltc::DecodeStatus) -> String {
+    let fps = status
+        .measured_fps
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_string());
+    let bpm = status
+        .smoothed_tempo_bpm
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_string());
+
+    format!(
+        "decode lock={:?} dir={:?} frames={} fps={} bpm={} edges={} v={} i={}",
+        status.lock_status,
+        status.direction,
+        status.decoded_frame_count,
+        fps,
+        bpm,
+        status.edge_count,
+        status.consecutive_valid_windows,
+        status.consecutive_invalid_windows,
+    )
 }
 
