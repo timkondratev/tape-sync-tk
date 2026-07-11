@@ -2,9 +2,10 @@ use std::env;
 use std::process;
 
 use cpal::traits::DeviceTrait;
+use tape_sync_tk::audio::AudioRuntime;
 use tape_sync_tk::cli::CliArgs;
 use tape_sync_tk::config::AppConfig;
-use tape_sync_tk::runtime::{AudioRuntime, initialize};
+use tape_sync_tk::runtime::initialize;
 
 fn main() {
     if let Err(error) = run() {

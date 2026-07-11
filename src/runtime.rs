@@ -1,33 +1,18 @@
 use crate::config::{AppConfig, Mode};
+use crate::audio::{self, AudioEndpoint, AudioRuntime};
+use crate::midi::{self, MidiOutputPort};
 use crate::startup::{StartupReport, SystemInventory, preflight};
 use cpal::traits::{DeviceTrait, HostTrait};
-use cpal::{Device, SupportedStreamConfigRange};
-use midir::MidiOutputConnection;
+use cpal::{Device, Stream};
 use std::fmt;
-
-#[cfg(unix)]
-use midir::os::unix::VirtualOutput;
 
 const RETRY_HINT: &str = "Fix the device or channel configuration, then try again.";
 
 #[derive(Debug)]
-pub struct StartupRuntime<A = Device, M = MidiOutputConnection> {
-    pub audio: AudioRuntime<A>,
+pub struct StartupRuntime<A = Device, S = Stream, M = MidiOutputPort> {
+    pub audio: AudioRuntime<A, S>,
     pub midi: M,
     pub report: StartupReport,
-}
-
-#[derive(Debug)]
-pub enum AudioRuntime<A = Device> {
-    Generate { output: AudioEndpoint<A> },
-    Decode { input: AudioEndpoint<A> },
-}
-
-#[derive(Debug)]
-pub struct AudioEndpoint<A> {
-    pub device: A,
-    pub sample_rate: u32,
-    pub channel: u16,
 }
 
 pub fn initialize(config: &AppConfig) -> Result<StartupRuntime, RuntimeError> {
@@ -40,7 +25,7 @@ pub fn initialize_with<B>(
     config: &AppConfig,
     inventory: &SystemInventory,
     backend: &B,
-) -> Result<StartupRuntime<B::AudioHandle, B::MidiHandle>, RuntimeError>
+) -> Result<StartupRuntime<B::AudioHandle, B::StreamHandle, B::MidiHandle>, RuntimeError>
 where
     B: RuntimeBackend,
 {
@@ -75,10 +60,17 @@ pub struct AudioRequest<'a> {
 
 pub trait RuntimeBackend {
     type AudioHandle;
+    type StreamHandle;
     type MidiHandle;
 
-    fn open_input(&self, request: AudioRequest<'_>) -> Result<AudioEndpoint<Self::AudioHandle>, RuntimeError>;
-    fn open_output(&self, request: AudioRequest<'_>) -> Result<AudioEndpoint<Self::AudioHandle>, RuntimeError>;
+    fn open_input(
+        &self,
+        request: AudioRequest<'_>,
+    ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError>;
+    fn open_output(
+        &self,
+        request: AudioRequest<'_>,
+    ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError>;
     fn create_virtual_midi_output(&self, port_name: &str) -> Result<Self::MidiHandle, RuntimeError>;
 }
 
@@ -86,34 +78,29 @@ pub struct SystemBackend;
 
 impl RuntimeBackend for SystemBackend {
     type AudioHandle = Device;
-    type MidiHandle = MidiOutputConnection;
+    type StreamHandle = Stream;
+    type MidiHandle = MidiOutputPort;
 
-    fn open_input(&self, request: AudioRequest<'_>) -> Result<AudioEndpoint<Self::AudioHandle>, RuntimeError> {
+    fn open_input(
+        &self,
+        request: AudioRequest<'_>,
+    ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError> {
         let host = cpal::default_host();
         let device = find_device(&host, request.device_name)?;
-        ensure_input_support(&device, request.sample_rate, request.channel)?;
-
-        Ok(AudioEndpoint {
-            device,
-            sample_rate: request.sample_rate,
-            channel: request.channel,
-        })
+        audio::open_input_stream(device, request.sample_rate, request.channel)
     }
 
-    fn open_output(&self, request: AudioRequest<'_>) -> Result<AudioEndpoint<Self::AudioHandle>, RuntimeError> {
+    fn open_output(
+        &self,
+        request: AudioRequest<'_>,
+    ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError> {
         let host = cpal::default_host();
         let device = find_device(&host, request.device_name)?;
-        ensure_output_support(&device, request.sample_rate, request.channel)?;
-
-        Ok(AudioEndpoint {
-            device,
-            sample_rate: request.sample_rate,
-            channel: request.channel,
-        })
+        audio::open_output_stream(device, request.sample_rate, request.channel)
     }
 
     fn create_virtual_midi_output(&self, port_name: &str) -> Result<Self::MidiHandle, RuntimeError> {
-        create_virtual_midi_output(port_name)
+        midi::create_virtual_output(port_name)
     }
 }
 
@@ -127,76 +114,13 @@ fn find_device(host: &cpal::Host, name: &str) -> Result<Device, RuntimeError> {
         .ok_or_else(|| RuntimeError::MissingAudioDevice(name.to_string()))
 }
 
-fn ensure_input_support(device: &Device, sample_rate: u32, channel: u16) -> Result<(), RuntimeError> {
-    let ranges = device
-        .supported_input_configs()
-        .map_err(|source| RuntimeError::AudioConfiguration(source.to_string()))?;
-    ensure_supported(ranges, sample_rate, channel, "input", &device_name(device)?)
-}
-
-fn ensure_output_support(device: &Device, sample_rate: u32, channel: u16) -> Result<(), RuntimeError> {
-    let ranges = device
-        .supported_output_configs()
-        .map_err(|source| RuntimeError::AudioConfiguration(source.to_string()))?;
-    ensure_supported(ranges, sample_rate, channel, "output", &device_name(device)?)
-}
-
-fn ensure_supported<I>(
-    ranges: I,
-    sample_rate: u32,
-    channel: u16,
-    direction: &str,
-    device_name: &str,
-) -> Result<(), RuntimeError>
-where
-    I: Iterator<Item = SupportedStreamConfigRange>,
-{
-    let supported = ranges.into_iter().any(|range| {
-        range.channels() > channel
-            && range.min_sample_rate().0 <= sample_rate
-            && range.max_sample_rate().0 >= sample_rate
-    });
-
-    if supported {
-        Ok(())
-    } else {
-        Err(RuntimeError::UnsupportedAudioConfiguration {
-            direction: direction.to_string(),
-            device_name: device_name.to_string(),
-            sample_rate,
-            channel,
-        })
-    }
-}
-
-fn device_name(device: &Device) -> Result<String, RuntimeError> {
-    device
-        .name()
-        .map_err(|source| RuntimeError::AudioConfiguration(source.to_string()))
-}
-
-#[cfg(unix)]
-fn create_virtual_midi_output(port_name: &str) -> Result<MidiOutputConnection, RuntimeError> {
-    let midi_output = midir::MidiOutput::new("TapeSync runtime init")
-        .map_err(|source| RuntimeError::Midi(source.to_string()))?;
-    midi_output
-        .create_virtual(port_name)
-        .map_err(|source| RuntimeError::Midi(source.to_string()))
-}
-
-#[cfg(not(any(target_os = "macos", all(unix, not(target_os = "macos")))))]
-fn create_virtual_midi_output(_port_name: &str) -> Result<MidiOutputConnection, RuntimeError> {
-    Err(RuntimeError::Midi(
-        "virtual MIDI output is unsupported on this platform".to_string(),
-    ))
-}
-
 #[derive(Debug)]
 pub enum RuntimeError {
     Inventory(crate::startup::InventoryError),
     Preflight(crate::startup::StartupError),
     AudioEnumeration(String),
     AudioConfiguration(String),
+    AudioStream(String),
     MissingAudioDevice(String),
     UnsupportedAudioConfiguration {
         direction: String,
@@ -217,6 +141,9 @@ impl fmt::Display for RuntimeError {
             }
             Self::AudioConfiguration(source) => {
                 write!(f, "failed to inspect audio device capabilities: {source}")
+            }
+            Self::AudioStream(source) => {
+                write!(f, "failed to open or start audio stream: {source}. {RETRY_HINT}")
             }
             Self::MissingAudioDevice(name) => {
                 write!(f, "configured audio device '{name}' was not found during runtime initialization. {RETRY_HINT}")
@@ -254,9 +181,13 @@ mod tests {
 
     impl RuntimeBackend for FakeBackend {
         type AudioHandle = String;
-        type MidiHandle = String;
+        type StreamHandle = FakeStream;
+        type MidiHandle = MidiOutputPort<String>;
 
-        fn open_input(&self, request: AudioRequest<'_>) -> Result<AudioEndpoint<Self::AudioHandle>, RuntimeError> {
+        fn open_input(
+            &self,
+            request: AudioRequest<'_>,
+        ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError> {
             if self.fail_input {
                 return Err(RuntimeError::UnsupportedAudioConfiguration {
                     direction: "input".to_string(),
@@ -270,10 +201,14 @@ mod tests {
                 device: request.device_name.to_string(),
                 sample_rate: request.sample_rate,
                 channel: request.channel,
+                stream: FakeStream,
             })
         }
 
-        fn open_output(&self, request: AudioRequest<'_>) -> Result<AudioEndpoint<Self::AudioHandle>, RuntimeError> {
+        fn open_output(
+            &self,
+            request: AudioRequest<'_>,
+        ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError> {
             if self.fail_output {
                 return Err(RuntimeError::UnsupportedAudioConfiguration {
                     direction: "output".to_string(),
@@ -287,6 +222,7 @@ mod tests {
                 device: request.device_name.to_string(),
                 sample_rate: request.sample_rate,
                 channel: request.channel,
+                stream: FakeStream,
             })
         }
 
@@ -295,9 +231,12 @@ mod tests {
                 return Err(RuntimeError::Midi("backend unavailable".to_string()));
             }
 
-            Ok(port_name.to_string())
+            Ok(MidiOutputPort::new(port_name.to_string(), port_name.to_string()))
         }
     }
+
+    #[derive(Debug)]
+    struct FakeStream;
 
     fn inventory() -> SystemInventory {
         SystemInventory {
@@ -370,7 +309,7 @@ send_transport = true
             AudioRuntime::Decode { .. } => panic!("expected generate runtime"),
         }
 
-        assert_eq!(runtime.midi, "TapeSync MIDI Out");
+        assert_eq!(runtime.midi.port_name, "TapeSync MIDI Out");
     }
 
     #[test]
