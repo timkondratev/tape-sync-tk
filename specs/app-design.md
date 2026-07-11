@@ -167,6 +167,11 @@ Pipeline:
 Implementation requirement:
 
 - Decoder filter/timing logic must be derived from `sample_rate` (no fixed 48 kHz coefficients).
+- Decoder must remain locked across practical tape varispeed pitch range, not only near nominal speed.
+
+Implementation note (MVP):
+
+- Bit-timing recovery uses adaptive half-bit tracking from observed edge intervals, with bounded speed ratios, instead of a fixed nominal timing tolerance.
 
 Outputs:
 

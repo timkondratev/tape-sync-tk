@@ -204,12 +204,21 @@ pub struct EdgeDetector {
 
 #[derive(Debug)]
 struct FrameDecoder {
+    nominal_half_bit_samples: f64,
     expected_half_bit_samples: f64,
     last_edge_sample: Option<usize>,
     last_edge_direction: Option<EdgeDirection>,
     pending_short_interval: bool,
     bits: Vec<bool>,
 }
+
+const MIN_TRACKED_SPEED_RATIO: f64 = 0.4;
+const MAX_TRACKED_SPEED_RATIO: f64 = 2.5;
+const SHORT_INTERVAL_MIN_RATIO: f64 = 0.55;
+const SHORT_INTERVAL_MAX_RATIO: f64 = 1.45;
+const LONG_INTERVAL_MIN_RATIO: f64 = 1.55;
+const LONG_INTERVAL_MAX_RATIO: f64 = 2.45;
+const TIMING_TRACK_ALPHA: f64 = 0.12;
 
 #[derive(Debug)]
 struct LtcPreFilter {
@@ -248,8 +257,10 @@ impl LtcPreFilter {
 
 impl FrameDecoder {
     fn new(sample_rate: u32, fps: Fps) -> Self {
+        let half_bit_samples = sample_rate as f64 / (fps.as_f64() * 160.0);
         Self {
-            expected_half_bit_samples: sample_rate as f64 / (fps.as_f64() * 160.0),
+            nominal_half_bit_samples: half_bit_samples,
+            expected_half_bit_samples: half_bit_samples,
             last_edge_sample: None,
             last_edge_direction: None,
             pending_short_interval: false,
@@ -266,11 +277,10 @@ impl FrameDecoder {
         self.last_edge_direction = Some(direction);
         let previous_edge = self.last_edge_sample.replace(edge_sample)?;
         let interval = edge_sample.saturating_sub(previous_edge) as f64;
-        let short_distance = (interval - self.expected_half_bit_samples).abs();
-        let long_distance = (interval - self.expected_half_bit_samples * 2.0).abs();
-        let tolerance = self.expected_half_bit_samples * 0.25;
+        let ratio = interval / self.expected_half_bit_samples;
 
-        if short_distance <= tolerance {
+        if (SHORT_INTERVAL_MIN_RATIO..=SHORT_INTERVAL_MAX_RATIO).contains(&ratio) {
+            self.track_half_bit(interval);
             if self.pending_short_interval {
                 self.pending_short_interval = false;
                 return self.push_bit(true);
@@ -279,7 +289,8 @@ impl FrameDecoder {
             return None;
         }
 
-        if long_distance <= tolerance {
+        if (LONG_INTERVAL_MIN_RATIO..=LONG_INTERVAL_MAX_RATIO).contains(&ratio) {
+            self.track_half_bit(interval / 2.0);
             self.pending_short_interval = false;
             return self.push_bit(false);
         }
@@ -293,6 +304,14 @@ impl FrameDecoder {
         self.last_edge_direction = None;
         self.pending_short_interval = false;
         self.bits.clear();
+    }
+
+    fn track_half_bit(&mut self, observed_half_bit_samples: f64) {
+        let min_half = self.nominal_half_bit_samples / MAX_TRACKED_SPEED_RATIO;
+        let max_half = self.nominal_half_bit_samples / MIN_TRACKED_SPEED_RATIO;
+        let clamped = observed_half_bit_samples.clamp(min_half, max_half);
+        self.expected_half_bit_samples +=
+            TIMING_TRACK_ALPHA * (clamped - self.expected_half_bit_samples);
     }
 
     fn push_bit(&mut self, bit: bool) -> Option<[bool; 80]> {
@@ -856,6 +875,31 @@ mod tests {
         assert!(decoder.bits.is_empty());
         assert!(decoder.last_edge_sample.is_none());
         assert!(decoder.last_edge_direction.is_none());
+    }
+
+    #[test]
+    fn frame_decoder_tracks_faster_playback_speed() {
+        let mut decoder = FrameDecoder::new(44_100, Fps::Fps30);
+
+        assert!(decoder.push_edge(0, EdgeDirection::Rising).is_none());
+
+        // About 1.33x speed: short interval around 0.75x nominal.
+        let short_interval = 7;
+        let mut sample = 0usize;
+        let mut direction = EdgeDirection::Rising;
+        for _ in 0..48 {
+            sample += short_interval;
+            direction = match direction {
+                EdgeDirection::Rising => EdgeDirection::Falling,
+                EdgeDirection::Falling => EdgeDirection::Rising,
+            };
+            let _ = decoder.push_edge(sample, direction);
+        }
+
+        assert!(
+            decoder.expected_half_bit_samples < decoder.nominal_half_bit_samples,
+            "expected half-bit should move lower at faster playback"
+        );
     }
 
     #[test]
