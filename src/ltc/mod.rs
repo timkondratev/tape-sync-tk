@@ -437,6 +437,20 @@ impl LockTracker {
             smoothed_tempo_bpm: None,
         }
     }
+
+    pub fn status(&self) -> DecodeStatus {
+        DecodeStatus {
+            lock_status: self.lock_status,
+            direction: PlaybackDirection::Forward,
+            edge_count: 0,
+            consecutive_valid_windows: self.consecutive_valid_windows,
+            consecutive_invalid_windows: self.consecutive_invalid_windows,
+            current_timecode: None,
+            decoded_frame_count: 0,
+            measured_fps: None,
+            smoothed_tempo_bpm: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -450,6 +464,7 @@ pub struct DecodeMonitor {
     ref_bpm: f64,
     smoothing_alpha: f64,
     sample_rate: u32,
+    nominal_samples_per_frame: f64,
     sample_offset: usize,
     decoded_frame_count: u64,
     last_timecode: Option<Timecode>,
@@ -462,6 +477,7 @@ pub struct DecodeMonitor {
     smoothed_tempo_bpm: Option<f64>,
     direction: PlaybackDirection,
     windows_without_decoded_frame: u32,
+    samples_since_lock_activity: f64,
 }
 
 impl DecodeMonitor {
@@ -476,6 +492,7 @@ impl DecodeMonitor {
             ref_bpm: request.ref_bpm,
             smoothing_alpha: request.smoothing_alpha,
             sample_rate,
+            nominal_samples_per_frame: sample_rate as f64 / request.fps.as_f64(),
             sample_offset: 0,
             decoded_frame_count: 0,
             last_timecode: None,
@@ -488,6 +505,7 @@ impl DecodeMonitor {
             smoothed_tempo_bpm: None,
             direction: PlaybackDirection::Forward,
             windows_without_decoded_frame: 0,
+            samples_since_lock_activity: 0.0,
         }
     }
 
@@ -524,7 +542,7 @@ impl DecodeMonitor {
 
         self.sample_offset += samples.len();
 
-        let mut status = self.lock_tracker.observe_window(decoded_timecode.is_some());
+        let mut status = self.observe_lock_activity(decoded_timecode.is_some(), samples.len());
         self.update_smoothed_tempo(status.lock_status);
         status.edge_count = edges.len();
         status.direction = self.direction;
@@ -557,6 +575,25 @@ impl DecodeMonitor {
         }
 
         self.previous_frame_sample = Some(frame_sample);
+    }
+
+    fn observe_lock_activity(
+        &mut self,
+        decoded_frame_in_chunk: bool,
+        processed_samples: usize,
+    ) -> DecodeStatus {
+        if decoded_frame_in_chunk {
+            self.samples_since_lock_activity = 0.0;
+            return self.lock_tracker.observe_window(true);
+        }
+
+        self.samples_since_lock_activity += processed_samples as f64;
+        if self.samples_since_lock_activity >= self.nominal_samples_per_frame {
+            self.samples_since_lock_activity -= self.nominal_samples_per_frame;
+            return self.lock_tracker.observe_window(false);
+        }
+
+        self.lock_tracker.status()
     }
 
     fn update_smoothed_tempo(&mut self, lock_status: LockStatus) {
@@ -986,6 +1023,42 @@ mod tests {
             final_status.lock_status,
             LockStatus::Locking | LockStatus::Locked
         ));
+    }
+
+    #[test]
+    fn decode_monitor_reaches_locked_with_small_audio_callbacks() {
+        let mut generator = LtcGenerator::new(
+            GeneratorRequest {
+                start: "01:00:00:00",
+                fps: Fps::Fps30,
+            },
+            44_100,
+        )
+        .expect("generator should initialize");
+        let mut monitor = DecodeMonitor::new(
+            DecodeRequest {
+                fps: Fps::Fps30,
+                ref_fps: Fps::Fps30,
+                ref_bpm: 120.0,
+                smoothing_alpha: 0.15,
+                fps_estimate_window_size: DEFAULT_FPS_ESTIMATE_WINDOW_SIZE,
+                dropout_reset_windows: DEFAULT_DROPOUT_RESET_WINDOWS,
+            },
+            44_100,
+        );
+
+        let mut final_status = DecodeStatus::default();
+        for _ in 0..500 {
+            let samples = (0..128)
+                .map(|_| generator.next_sample())
+                .collect::<Vec<_>>();
+            final_status = monitor.process_samples(&samples);
+            if final_status.lock_status == LockStatus::Locked {
+                break;
+            }
+        }
+
+        assert_eq!(final_status.lock_status, LockStatus::Locked);
     }
 
     #[test]
