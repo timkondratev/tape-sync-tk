@@ -1,0 +1,29 @@
+mode = "generate"
+
+[audio]
+sample_rate = 44100
+input_device = "Replace with an available input device"
+input_channel = 0
+output_device = "Replace with an available output device"
+output_channel = 0
+
+[timecode]
+start = "01:00:00:00"
+ltc_fps = 30.0
+
+[tempo]
+ref_bpm = 128.0
+ref_fps = 30.0
+smoothing_alpha = 0.15
+
+[latency_ms]
+audio_output = 5.0
+tape_path = 20.0
+decoder = 10.0
+manual = 0.0
+
+[midi]
+port_name = "TapeSync MIDI Out"
+send_mtc = false
+send_clock = true
+send_transport = true

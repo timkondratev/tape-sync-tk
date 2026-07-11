@@ -317,4 +317,13 @@ send_transport = true
         let error = AppConfig::from_toml_str(&raw).expect_err("empty port name should fail");
         assert!(error.to_string().contains("midi.port_name"));
     }
+
+    #[test]
+    fn example_config_parses_and_validates() {
+        let config = AppConfig::from_toml_str(include_str!("../tape-sync.example.toml"))
+            .expect("example config should stay valid");
+
+        assert_eq!(config.audio.sample_rate, 44100);
+        assert_eq!(config.timecode.ltc_fps.as_f64(), 30.0);
+    }
 }
