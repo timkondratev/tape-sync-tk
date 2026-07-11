@@ -1,5 +1,6 @@
 use crate::config::{AppConfig, Mode};
 use crate::audio::{self, AudioEndpoint, AudioRuntime};
+use crate::ltc::GeneratorRequest;
 use crate::midi::{self, MidiOutputPort};
 use crate::startup::{StartupReport, SystemInventory, preflight};
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -36,6 +37,9 @@ where
                 device_name: &config.audio.output_device,
                 sample_rate: config.audio.sample_rate,
                 channel: config.audio.output_channel,
+            }, GeneratorRequest {
+                start: &config.timecode.start,
+                fps: config.timecode.ltc_fps,
             })?,
         },
         Mode::Decode => AudioRuntime::Decode {
@@ -70,6 +74,7 @@ pub trait RuntimeBackend {
     fn open_output(
         &self,
         request: AudioRequest<'_>,
+        generator_request: GeneratorRequest<'_>,
     ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError>;
     fn create_virtual_midi_output(&self, port_name: &str) -> Result<Self::MidiHandle, RuntimeError>;
 }
@@ -93,10 +98,11 @@ impl RuntimeBackend for SystemBackend {
     fn open_output(
         &self,
         request: AudioRequest<'_>,
+        generator_request: GeneratorRequest<'_>,
     ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError> {
         let host = cpal::default_host();
         let device = find_device(&host, request.device_name)?;
-        audio::open_output_stream(device, request.sample_rate, request.channel)
+        audio::open_output_stream(device, request.sample_rate, request.channel, generator_request)
     }
 
     fn create_virtual_midi_output(&self, port_name: &str) -> Result<Self::MidiHandle, RuntimeError> {
@@ -121,6 +127,7 @@ pub enum RuntimeError {
     AudioEnumeration(String),
     AudioConfiguration(String),
     AudioStream(String),
+    Ltc(String),
     MissingAudioDevice(String),
     UnsupportedAudioConfiguration {
         direction: String,
@@ -144,6 +151,9 @@ impl fmt::Display for RuntimeError {
             }
             Self::AudioStream(source) => {
                 write!(f, "failed to open or start audio stream: {source}. {RETRY_HINT}")
+            }
+            Self::Ltc(source) => {
+                write!(f, "failed to initialize LTC generator: {source}. {RETRY_HINT}")
             }
             Self::MissingAudioDevice(name) => {
                 write!(f, "configured audio device '{name}' was not found during runtime initialization. {RETRY_HINT}")
@@ -208,6 +218,7 @@ mod tests {
         fn open_output(
             &self,
             request: AudioRequest<'_>,
+            _generator_request: GeneratorRequest<'_>,
         ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError> {
             if self.fail_output {
                 return Err(RuntimeError::UnsupportedAudioConfiguration {

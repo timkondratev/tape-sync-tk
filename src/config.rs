@@ -3,6 +3,9 @@ use serde::{Deserialize, Deserializer};
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
+
+use crate::ltc::Timecode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -11,7 +14,7 @@ pub enum Mode {
     Decode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fps {
     Fps24,
     Fps25,
@@ -26,6 +29,14 @@ impl Fps {
             Self::Fps25 => 25.0,
             Self::Fps29_97 => 29.97,
             Self::Fps30 => 30.0,
+        }
+    }
+
+    pub fn frame_count_base(self) -> u8 {
+        match self {
+            Self::Fps24 => 24,
+            Self::Fps25 => 25,
+            Self::Fps29_97 | Self::Fps30 => 30,
         }
     }
 }
@@ -154,6 +165,21 @@ impl AppConfig {
             return Err(ConfigError::Validation {
                 field: "midi.port_name",
                 message: "must not be empty".to_string(),
+            });
+        }
+
+        let timecode = Timecode::from_str(&self.timecode.start).map_err(|source| ConfigError::Validation {
+            field: "timecode.start",
+            message: source.to_string(),
+        })?;
+
+        if timecode.frames >= self.timecode.ltc_fps.frame_count_base() {
+            return Err(ConfigError::Validation {
+                field: "timecode.start",
+                message: format!(
+                    "frame value exceeds allowed range for {} fps",
+                    self.timecode.ltc_fps.as_f64()
+                ),
             });
         }
 
@@ -316,6 +342,13 @@ send_transport = true
         let raw = valid_config().replace("port_name = \"TapeSync MIDI Out\"", "port_name = \"   \"");
         let error = AppConfig::from_toml_str(&raw).expect_err("empty port name should fail");
         assert!(error.to_string().contains("midi.port_name"));
+    }
+
+    #[test]
+    fn rejects_timecode_frame_out_of_range_for_fps() {
+        let raw = valid_config().replace("start = \"01:00:00:00\"", "start = \"01:00:00:30\"");
+        let error = AppConfig::from_toml_str(&raw).expect_err("timecode start should fail");
+        assert!(error.to_string().contains("timecode.start"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfigRange};
 
+use crate::ltc::{GeneratorRequest, LtcGenerator};
 use crate::runtime::RuntimeError;
 
 #[derive(Debug)]
@@ -50,6 +51,7 @@ pub fn open_output_stream(
     device: Device,
     sample_rate: u32,
     channel: u16,
+    generator_request: GeneratorRequest<'_>,
 ) -> Result<AudioEndpoint<Device, Stream>, RuntimeError> {
     let device_name = device_name(&device)?;
     let supported = select_supported_config(
@@ -62,7 +64,13 @@ pub fn open_output_stream(
         &device_name,
     )?;
     let config = supported_to_stream_config(&supported, sample_rate);
-    let stream = build_output_stream(&device, &config, supported.sample_format())?;
+    let stream = build_output_stream(
+        &device,
+        &config,
+        supported.sample_format(),
+        channel,
+        generator_request,
+    )?;
     stream
         .play()
         .map_err(|source| RuntimeError::AudioStream(source.to_string()))?;
@@ -151,14 +159,24 @@ fn build_output_stream(
     device: &Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
+    channel: u16,
+    generator_request: GeneratorRequest<'_>,
 ) -> Result<Stream, RuntimeError> {
     let err_fn = |error| eprintln!("audio output stream error: {error}");
+    let mut generator =
+        LtcGenerator::new(generator_request, config.sample_rate.0).map_err(|source| {
+            RuntimeError::Ltc(source.to_string())
+        })?;
+    let channel_count = config.channels as usize;
+    let target_channel = channel as usize;
 
     match sample_format {
         SampleFormat::F32 => device
             .build_output_stream(
                 config,
-                move |data: &mut [f32], _| data.fill(0.0),
+                move |data: &mut [f32], _| {
+                    render_f32_output(data, channel_count, target_channel, &mut generator)
+                },
                 err_fn,
                 None,
             )
@@ -166,7 +184,9 @@ fn build_output_stream(
         SampleFormat::I16 => device
             .build_output_stream(
                 config,
-                move |data: &mut [i16], _| data.fill(0),
+                move |data: &mut [i16], _| {
+                    render_i16_output(data, channel_count, target_channel, &mut generator)
+                },
                 err_fn,
                 None,
             )
@@ -174,7 +194,9 @@ fn build_output_stream(
         SampleFormat::U16 => device
             .build_output_stream(
                 config,
-                move |data: &mut [u16], _| data.fill(u16::MAX / 2),
+                move |data: &mut [u16], _| {
+                    render_u16_output(data, channel_count, target_channel, &mut generator)
+                },
                 err_fn,
                 None,
             )
@@ -185,8 +207,94 @@ fn build_output_stream(
     }
 }
 
+fn render_f32_output(
+    data: &mut [f32],
+    channel_count: usize,
+    target_channel: usize,
+    generator: &mut LtcGenerator,
+) {
+    data.fill(0.0);
+    for frame in data.chunks_mut(channel_count) {
+        if let Some(sample) = frame.get_mut(target_channel) {
+            *sample = generator.next_sample();
+        }
+    }
+}
+
+fn render_i16_output(
+    data: &mut [i16],
+    channel_count: usize,
+    target_channel: usize,
+    generator: &mut LtcGenerator,
+) {
+    data.fill(0);
+    for frame in data.chunks_mut(channel_count) {
+        if let Some(sample) = frame.get_mut(target_channel) {
+            *sample = f32_to_i16(generator.next_sample());
+        }
+    }
+}
+
+fn render_u16_output(
+    data: &mut [u16],
+    channel_count: usize,
+    target_channel: usize,
+    generator: &mut LtcGenerator,
+) {
+    data.fill(u16::MAX / 2);
+    for frame in data.chunks_mut(channel_count) {
+        if let Some(sample) = frame.get_mut(target_channel) {
+            *sample = f32_to_u16(generator.next_sample());
+        }
+    }
+}
+
+fn f32_to_i16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+fn f32_to_u16(sample: f32) -> u16 {
+    (((sample.clamp(-1.0, 1.0) + 1.0) * 0.5) * u16::MAX as f32).round() as u16
+}
+
 pub fn device_name(device: &Device) -> Result<String, RuntimeError> {
     device
         .name()
         .map_err(|source| RuntimeError::AudioConfiguration(source.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Fps;
+
+    fn generator() -> LtcGenerator {
+        LtcGenerator::new(
+            GeneratorRequest {
+                start: "01:00:00:00",
+                fps: Fps::Fps30,
+            },
+            44_100,
+        )
+        .expect("generator should initialize")
+    }
+
+    #[test]
+    fn renders_only_target_channel() {
+        let mut buffer = [0.0_f32; 8];
+        let mut generator = generator();
+        render_f32_output(&mut buffer, 2, 1, &mut generator);
+
+        assert!(buffer.iter().step_by(2).all(|sample| *sample == 0.0));
+        assert!(buffer.iter().skip(1).step_by(2).any(|sample| *sample != 0.0));
+    }
+
+    #[test]
+    fn converts_generator_output_to_unsigned_pcm() {
+        let mut buffer = [0_u16; 4];
+        let mut generator = generator();
+        render_u16_output(&mut buffer, 1, 0, &mut generator);
+
+        assert!(buffer.iter().any(|sample| *sample != u16::MAX / 2));
+    }
 }
