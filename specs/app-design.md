@@ -194,6 +194,10 @@ Given decoded frame timing:
 - Compute `tempo_bpm = ref_bpm * ratio`.
 - Apply smoothing before MIDI clock scheduling.
 
+Implementation note (MVP):
+
+- During startup acquisition (`unlocked`/`locking`), tempo readout uses current measured tempo directly; once `locked`, configured smoothing is applied. Unlock/dropout behavior remains unchanged.
+
 Acceptance:
 
 - If tape speed changes by `+5%`, output clock converges near `ref_bpm * 1.05`.

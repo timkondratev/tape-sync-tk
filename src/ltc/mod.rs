@@ -454,6 +454,7 @@ pub struct DecodeMonitor {
     decoded_frame_count: u64,
     last_timecode: Option<Timecode>,
     previous_frame_sample: Option<usize>,
+    last_instantaneous_fps: Option<f64>,
     recent_fps_samples: VecDeque<f64>,
     fps_estimate_window_size: usize,
     dropout_reset_windows: u32,
@@ -479,6 +480,7 @@ impl DecodeMonitor {
             decoded_frame_count: 0,
             last_timecode: None,
             previous_frame_sample: None,
+            last_instantaneous_fps: None,
             recent_fps_samples: VecDeque::with_capacity(request.fps_estimate_window_size),
             fps_estimate_window_size: request.fps_estimate_window_size,
             dropout_reset_windows: request.dropout_reset_windows,
@@ -514,6 +516,7 @@ impl DecodeMonitor {
             self.windows_without_decoded_frame += 1;
             if self.windows_without_decoded_frame >= self.dropout_reset_windows {
                 self.recent_fps_samples.clear();
+                self.last_instantaneous_fps = None;
                 self.measured_fps = None;
                 self.smoothed_tempo_bpm = None;
             }
@@ -522,6 +525,7 @@ impl DecodeMonitor {
         self.sample_offset += samples.len();
 
         let mut status = self.lock_tracker.observe_window(decoded_timecode.is_some());
+        self.update_smoothed_tempo(status.lock_status);
         status.edge_count = edges.len();
         status.direction = self.direction;
         status.current_timecode = self.last_timecode;
@@ -540,6 +544,7 @@ impl DecodeMonitor {
             let sample_delta = frame_sample.saturating_sub(previous_frame_sample);
             if sample_delta > 0 {
                 let instantaneous_fps = self.sample_rate as f64 / sample_delta as f64;
+                self.last_instantaneous_fps = Some(instantaneous_fps);
                 self.recent_fps_samples.push_back(instantaneous_fps);
                 while self.recent_fps_samples.len() > self.fps_estimate_window_size {
                     self.recent_fps_samples.pop_front();
@@ -548,18 +553,30 @@ impl DecodeMonitor {
                 let measured_fps = self.recent_fps_samples.iter().sum::<f64>()
                     / self.recent_fps_samples.len() as f64;
                 self.measured_fps = Some(measured_fps);
-
-                let measured_tempo_bpm = self.ref_bpm * (measured_fps / self.ref_fps.as_f64());
-                self.smoothed_tempo_bpm = Some(match self.smoothed_tempo_bpm {
-                    Some(previous) => {
-                        previous + self.smoothing_alpha * (measured_tempo_bpm - previous)
-                    }
-                    None => measured_tempo_bpm,
-                });
             }
         }
 
         self.previous_frame_sample = Some(frame_sample);
+    }
+
+    fn update_smoothed_tempo(&mut self, lock_status: LockStatus) {
+        let instantaneous_fps = match self.last_instantaneous_fps {
+            Some(value) => value,
+            None => return,
+        };
+
+        let instantaneous_tempo_bpm = self.ref_bpm * (instantaneous_fps / self.ref_fps.as_f64());
+
+        self.smoothed_tempo_bpm = Some(match lock_status {
+            // During acquisition, prefer immediate tempo readout to avoid startup ramp.
+            LockStatus::Unlocked | LockStatus::Locking => instantaneous_tempo_bpm,
+            LockStatus::Locked => match self.smoothed_tempo_bpm {
+                Some(previous) => {
+                    previous + self.smoothing_alpha * (instantaneous_tempo_bpm - previous)
+                }
+                None => instantaneous_tempo_bpm,
+            },
+        });
     }
 }
 
@@ -969,6 +986,31 @@ mod tests {
             final_status.lock_status,
             LockStatus::Locking | LockStatus::Locked
         ));
+    }
+
+    #[test]
+    fn startup_acquisition_bypasses_smoothing_until_locked() {
+        let mut monitor = DecodeMonitor::new(
+            DecodeRequest {
+                fps: Fps::Fps30,
+                ref_fps: Fps::Fps30,
+                ref_bpm: 120.0,
+                smoothing_alpha: 0.01,
+                fps_estimate_window_size: DEFAULT_FPS_ESTIMATE_WINDOW_SIZE,
+                dropout_reset_windows: DEFAULT_DROPOUT_RESET_WINDOWS,
+            },
+            44_100,
+        );
+
+        monitor.last_instantaneous_fps = Some(45.0);
+        monitor.smoothed_tempo_bpm = Some(100.0);
+        monitor.update_smoothed_tempo(LockStatus::Locking);
+
+        let expected = 120.0 * (45.0 / 30.0);
+        let actual = monitor
+            .smoothed_tempo_bpm
+            .expect("tempo should be set during acquisition");
+        assert!((actual - expected).abs() < 1e-9);
     }
 
     #[test]
