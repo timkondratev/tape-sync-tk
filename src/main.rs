@@ -1,5 +1,9 @@
 use std::env;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use cpal::traits::DeviceTrait;
 use tape_sync_tk::audio::AudioRuntime;
@@ -60,6 +64,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             status.smoothed_tempo_bpm
         );
     }
+
+    println!("running {:?} mode; press Ctrl-C to stop", config.mode);
+    wait_for_shutdown()?;
+
+    drop(runtime);
+    println!("shutdown complete for {:?} mode", config.mode);
+    Ok(())
+}
+
+fn wait_for_shutdown() -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&shutdown_requested);
+
+    ctrlc::set_handler(move || {
+        handler_flag.store(true, Ordering::SeqCst);
+    })?;
+
+    while !shutdown_requested.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(200));
+    }
+
     Ok(())
 }
 
