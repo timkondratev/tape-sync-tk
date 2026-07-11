@@ -107,6 +107,36 @@ cargo run -- --config path/to/your-config.toml
 
 Stop with Ctrl-C.
 
+## Main tested Use Case: Tascam PortaStudio + Ableton Live
+
+This is the primary real-world workflow used to validate Tape Sync TK end-to-end.
+
+### Setup goal
+
+Use a Tascam PortaStudio as the transport master and have Ableton Live chase tape via LTC decode and MIDI sync.
+
+### Recommended routing
+
+1. Reserve one PortaStudio track for LTC only (commonly track 4 or track 8).
+2. Connect your audio interface output to the PortaStudio input used for striping LTC.
+3. Connect the PortaStudio LTC playback output to your audio interface input channel configured in Tape Sync TK.
+4. In Ableton Live, select the Tape Sync TK virtual MIDI output port and enable external sync.
+
+### Workflow
+
+1. Run Tape Sync TK in generate mode and record LTC to the dedicated PortaStudio track.
+2. Rewind tape and switch Tape Sync TK to decode mode.
+3. Start playback on the PortaStudio.
+4. Tape Sync TK decodes LTC and emits MIDI SPP/Start/Clock so Ableton Live follows tape position and speed.
+
+### What to verify during testing
+
+1. Lock state transitions to locked shortly after playback begins.
+2. Ableton Live transport starts from decoded tape position after lock.
+3. Clock remains stable during steady tape speed.
+4. Varispeed changes on the PortaStudio produce matching tempo changes in Ableton Live.
+5. Latency adjustments in [latency_ms] produce expected timing shifts.
+
 ## How To Use
 
 ### Generate mode (stripe tape)
