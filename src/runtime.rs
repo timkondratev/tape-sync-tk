@@ -1,6 +1,6 @@
 use crate::config::{AppConfig, Mode};
 use crate::audio::{self, AudioEndpoint, AudioRuntime};
-use crate::ltc::{DecodeRequest, GeneratorRequest, SharedDecodeStatusHandler, Timecode};
+use crate::ltc::{DecodeRequest, DecodeStatus, GeneratorRequest, SharedDecodeStatusHandler, Timecode};
 use crate::midi::{self, MidiOutputPort, MidiTransport};
 use crate::startup::{StartupReport, SystemInventory, preflight};
 use crate::sync_core::{DecodeSyncBridge, SyncEngine};
@@ -17,6 +17,18 @@ pub struct StartupRuntime<A = Device, S = Stream, M = MidiOutputPort> {
     pub midi_port_name: String,
     pub report: StartupReport,
     _midi: Option<M>,
+}
+
+impl<A, S, M> StartupRuntime<A, S, M> {
+    pub fn decode_status_snapshot(&self) -> Option<DecodeStatus> {
+        match &self.audio {
+            AudioRuntime::Decode { input } => input
+                .decode_status
+                .as_ref()
+                .and_then(|status| status.lock().ok().map(|status| status.clone())),
+            AudioRuntime::Generate { .. } => None,
+        }
+    }
 }
 
 pub fn initialize(config: &AppConfig) -> Result<StartupRuntime, RuntimeError> {
@@ -75,6 +87,8 @@ where
                             ref_fps: config.tempo.ref_fps,
                             ref_bpm: config.tempo.ref_bpm,
                             smoothing_alpha: config.tempo.smoothing_alpha,
+                            fps_estimate_window_size: config.decode.fps_estimate_window_frames,
+                            dropout_reset_windows: config.decode.dropout_reset_windows,
                         },
                         decode_status_handler,
                     )?,
@@ -250,6 +264,7 @@ impl std::error::Error for RuntimeError {}
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::ltc::{DecodeMonitor, LtcGenerator, PlaybackDirection};
     use crate::midi::MidiSink;
     use crate::startup::{AudioDeviceInfo, MidiEnvironment};
 
@@ -382,6 +397,10 @@ ref_bpm = 128.0
 ref_fps = 30.0
 smoothing_alpha = 0.15
 
+[decode]
+fps_estimate_window_frames = 12
+dropout_reset_windows = 8
+
 [latency_ms]
 audio_output = 5.0
 tape_path = 20.0
@@ -445,5 +464,56 @@ send_transport = true
         .expect_err("midi init should fail");
 
         assert!(error.to_string().contains("failed to initialize MIDI output"));
+    }
+
+    #[test]
+    fn decode_runtime_snapshot_reflects_processed_ltc_status() {
+        let runtime = initialize_with(&config("decode"), &inventory(), &FakeBackend::default())
+            .expect("runtime should initialize");
+
+        let mut generator = LtcGenerator::new(
+            GeneratorRequest {
+                start: "01:00:00:00",
+                fps: crate::config::Fps::Fps30,
+            },
+            44_100,
+        )
+        .expect("generator should initialize");
+        let mut monitor = DecodeMonitor::new(
+            DecodeRequest {
+                fps: crate::config::Fps::Fps30,
+                ref_fps: crate::config::Fps::Fps30,
+                ref_bpm: 128.0,
+                smoothing_alpha: 0.15,
+                fps_estimate_window_size: 12,
+                dropout_reset_windows: 8,
+            },
+            44_100,
+        );
+
+        let mut synthesized_status = crate::ltc::DecodeStatus::default();
+        for _ in 0..80 {
+            let samples = (0..256)
+                .map(|_| generator.next_sample())
+                .collect::<Vec<_>>();
+            synthesized_status = monitor.process_samples(&samples);
+        }
+
+        match &runtime.audio {
+            AudioRuntime::Decode { input } => {
+                let decode_status = input.decode_status.as_ref().expect("decode status should exist");
+                *decode_status.lock().expect("status lock should succeed") = synthesized_status;
+            }
+            AudioRuntime::Generate { .. } => panic!("expected decode runtime"),
+        }
+
+        let snapshot = runtime
+            .decode_status_snapshot()
+            .expect("decode snapshot should be available");
+        assert!(snapshot.decoded_frame_count > 0);
+        assert!(snapshot.current_timecode.is_some());
+        assert!(snapshot.measured_fps.is_some());
+        assert!(snapshot.smoothed_tempo_bpm.is_some());
+        assert!(matches!(snapshot.direction, PlaybackDirection::Forward));
     }
 }

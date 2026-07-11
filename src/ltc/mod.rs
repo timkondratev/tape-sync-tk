@@ -1,5 +1,6 @@
 use crate::config::Fps;
 use std::fmt;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 
@@ -8,6 +9,9 @@ const SYNC_WORD: [bool; 16] = [
     false, false, true, true, true, true, true, true, true, true, true, true, true, true, false,
     true,
 ];
+
+const DEFAULT_FPS_ESTIMATE_WINDOW_SIZE: usize = 12;
+const DEFAULT_DROPOUT_RESET_WINDOWS: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timecode {
@@ -174,6 +178,8 @@ pub struct DecodeRequest {
     pub ref_fps: Fps,
     pub ref_bpm: f64,
     pub smoothing_alpha: f64,
+    pub fps_estimate_window_size: usize,
+    pub dropout_reset_windows: u32,
 }
 
 #[derive(Debug)]
@@ -378,9 +384,13 @@ pub struct DecodeMonitor {
     decoded_frame_count: u64,
     last_timecode: Option<Timecode>,
     previous_frame_sample: Option<usize>,
+    recent_fps_samples: VecDeque<f64>,
+    fps_estimate_window_size: usize,
+    dropout_reset_windows: u32,
     measured_fps: Option<f64>,
     smoothed_tempo_bpm: Option<f64>,
     direction: PlaybackDirection,
+    windows_without_decoded_frame: u32,
 }
 
 impl DecodeMonitor {
@@ -398,9 +408,13 @@ impl DecodeMonitor {
             decoded_frame_count: 0,
             last_timecode: None,
             previous_frame_sample: None,
+            recent_fps_samples: VecDeque::with_capacity(request.fps_estimate_window_size),
+            fps_estimate_window_size: request.fps_estimate_window_size,
+            dropout_reset_windows: request.dropout_reset_windows,
             measured_fps: None,
             smoothed_tempo_bpm: None,
             direction: PlaybackDirection::Forward,
+            windows_without_decoded_frame: 0,
         }
     }
 
@@ -416,6 +430,17 @@ impl DecodeMonitor {
                     self.last_timecode = Some(timecode);
                     decoded_timecode = Some(timecode);
                 }
+            }
+        }
+
+        if decoded_timecode.is_some() {
+            self.windows_without_decoded_frame = 0;
+        } else {
+            self.windows_without_decoded_frame += 1;
+            if self.windows_without_decoded_frame >= self.dropout_reset_windows {
+                self.recent_fps_samples.clear();
+                self.measured_fps = None;
+                self.smoothed_tempo_bpm = None;
             }
         }
 
@@ -439,7 +464,14 @@ impl DecodeMonitor {
         if let Some(previous_frame_sample) = self.previous_frame_sample {
             let sample_delta = frame_sample.saturating_sub(previous_frame_sample);
             if sample_delta > 0 {
-                let measured_fps = self.sample_rate as f64 / sample_delta as f64;
+                let instantaneous_fps = self.sample_rate as f64 / sample_delta as f64;
+                self.recent_fps_samples.push_back(instantaneous_fps);
+                while self.recent_fps_samples.len() > self.fps_estimate_window_size {
+                    self.recent_fps_samples.pop_front();
+                }
+
+                let measured_fps = self.recent_fps_samples.iter().sum::<f64>()
+                    / self.recent_fps_samples.len() as f64;
                 self.measured_fps = Some(measured_fps);
 
                 let measured_tempo_bpm = self.ref_bpm * (measured_fps / self.ref_fps.as_f64());
@@ -464,6 +496,8 @@ impl Default for DecodeMonitor {
                 ref_fps: Fps::Fps30,
                 ref_bpm: 120.0,
                 smoothing_alpha: 0.15,
+                fps_estimate_window_size: DEFAULT_FPS_ESTIMATE_WINDOW_SIZE,
+                dropout_reset_windows: DEFAULT_DROPOUT_RESET_WINDOWS,
             },
             44_100,
         )
@@ -736,6 +770,8 @@ mod tests {
                 ref_fps: Fps::Fps30,
                 ref_bpm: 120.0,
                 smoothing_alpha: 0.15,
+                fps_estimate_window_size: DEFAULT_FPS_ESTIMATE_WINDOW_SIZE,
+                dropout_reset_windows: DEFAULT_DROPOUT_RESET_WINDOWS,
             },
             44_100,
         );
@@ -761,6 +797,8 @@ mod tests {
                 ref_fps: Fps::Fps30,
                 ref_bpm: 120.0,
                 smoothing_alpha: 0.15,
+                fps_estimate_window_size: DEFAULT_FPS_ESTIMATE_WINDOW_SIZE,
+                dropout_reset_windows: DEFAULT_DROPOUT_RESET_WINDOWS,
             },
             44_100,
         );
@@ -799,5 +837,43 @@ mod tests {
         };
 
         assert_eq!(infer_direction(previous, current, Fps::Fps30), PlaybackDirection::Reverse);
+    }
+
+    #[test]
+    fn clears_timing_metrics_after_decode_dropout() {
+        let mut generator = LtcGenerator::new(
+            GeneratorRequest {
+                start: "01:00:00:00",
+                fps: Fps::Fps30,
+            },
+            44_100,
+        )
+        .expect("generator should initialize");
+        let mut monitor = DecodeMonitor::new(
+            DecodeRequest {
+                fps: Fps::Fps30,
+                ref_fps: Fps::Fps30,
+                ref_bpm: 120.0,
+                smoothing_alpha: 0.15,
+                fps_estimate_window_size: DEFAULT_FPS_ESTIMATE_WINDOW_SIZE,
+                dropout_reset_windows: DEFAULT_DROPOUT_RESET_WINDOWS,
+            },
+            44_100,
+        );
+
+        for _ in 0..40 {
+            let samples = (0..256)
+                .map(|_| generator.next_sample())
+                .collect::<Vec<_>>();
+            let _ = monitor.process_samples(&samples);
+        }
+        assert!(monitor.measured_fps.is_some());
+
+        for _ in 0..DEFAULT_DROPOUT_RESET_WINDOWS {
+            let _ = monitor.process_samples(&[0.0; 256]);
+        }
+
+        assert!(monitor.measured_fps.is_none());
+        assert!(monitor.smoothed_tempo_bpm.is_none());
     }
 }

@@ -16,6 +16,10 @@ ref_bpm = 128.0
 ref_fps = 30.0
 smoothing_alpha = 0.15
 
+[decode]
+fps_estimate_window_frames = 12
+dropout_reset_windows = 8
+
 [latency_ms]
 audio_output = 5.0
 tape_path = 20.0

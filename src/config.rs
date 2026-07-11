@@ -99,6 +99,8 @@ pub struct AppConfig {
     pub audio: AudioConfig,
     pub timecode: TimecodeConfig,
     pub tempo: TempoConfig,
+    #[serde(default)]
+    pub decode: DecodeConfig,
     pub latency_ms: LatencyConfig,
     pub midi: MidiConfig,
 }
@@ -125,6 +127,18 @@ impl AppConfig {
             self.tempo.smoothing_alpha,
             0.01,
             1.0,
+        )?;
+        validate_range(
+            "decode.fps_estimate_window_frames",
+            self.decode.fps_estimate_window_frames as f64,
+            1.0,
+            120.0,
+        )?;
+        validate_range(
+            "decode.dropout_reset_windows",
+            self.decode.dropout_reset_windows as f64,
+            1.0,
+            120.0,
         )?;
         validate_range(
             "latency_ms.audio_output",
@@ -228,6 +242,21 @@ pub struct TempoConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct DecodeConfig {
+    pub fps_estimate_window_frames: usize,
+    pub dropout_reset_windows: u32,
+}
+
+impl Default for DecodeConfig {
+    fn default() -> Self {
+        Self {
+            fps_estimate_window_frames: 12,
+            dropout_reset_windows: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LatencyConfig {
     pub audio_output: f64,
     pub tape_path: f64,
@@ -294,6 +323,10 @@ ref_bpm = 128.0
 ref_fps = 30.0
 smoothing_alpha = 0.15
 
+[decode]
+fps_estimate_window_frames = 12
+dropout_reset_windows = 8
+
 [latency_ms]
 audio_output = 5.0
 tape_path = 20.0
@@ -328,6 +361,13 @@ send_transport = true
         let raw = valid_config().replace("smoothing_alpha = 0.15", "smoothing_alpha = 0.009");
         let error = AppConfig::from_toml_str(&raw).expect_err("alpha should be rejected");
         assert!(error.to_string().contains("tempo.smoothing_alpha"));
+    }
+
+    #[test]
+    fn rejects_decode_window_size_below_minimum() {
+        let raw = valid_config().replace("fps_estimate_window_frames = 12", "fps_estimate_window_frames = 0");
+        let error = AppConfig::from_toml_str(&raw).expect_err("window size should be rejected");
+        assert!(error.to_string().contains("decode.fps_estimate_window_frames"));
     }
 
     #[test]

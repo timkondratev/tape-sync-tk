@@ -26,7 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_path(&args.config_path)?;
     let runtime = initialize(&config)?;
 
-    for warning in runtime.report.warnings {
+    for warning in &runtime.report.warnings {
         eprintln!("warning: {warning}");
     }
 
@@ -49,6 +49,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "startup initialization passed for {:?} mode with total latency {:.2} ms; {mode_summary}",
         config.mode, runtime.report.total_latency_ms
     );
+
+    if let Some(status) = runtime.decode_status_snapshot() {
+        println!(
+            "decode status: lock={:?}, direction={:?}, decoded_frames={}, measured_fps={:?}, smoothed_tempo_bpm={:?}",
+            status.lock_status,
+            status.direction,
+            status.decoded_frame_count,
+            status.measured_fps,
+            status.smoothed_tempo_bpm
+        );
+    }
     Ok(())
 }
 
