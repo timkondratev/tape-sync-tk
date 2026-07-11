@@ -37,7 +37,11 @@ impl<P: MidiTransport> SyncEngine<P> {
         {
             self.midi
                 .send_song_position_pointer(update.song_position_pointer)?;
-            self.midi.send_start()?;
+            if update.song_position_pointer == 0 {
+                self.midi.send_start()?;
+            } else {
+                self.midi.send_continue()?;
+            }
         }
 
         if self.send_transport
@@ -237,7 +241,24 @@ mod tests {
             .expect("lock update should send transport");
 
         let connection = engine.into_midi().into_inner();
-        assert_eq!(connection.messages, vec![vec![0xF2, 0x34, 0x24], vec![0xFA]]);
+        assert_eq!(connection.messages, vec![vec![0xF2, 0x34, 0x24], vec![0xFB]]);
+    }
+
+    #[test]
+    fn sends_spp_then_start_on_lock_when_position_is_zero() {
+        let mut engine = engine();
+
+        engine
+            .apply_update(SyncUpdate {
+                lock_status: LockStatus::Locked,
+                direction: PlaybackDirection::Forward,
+                song_position_pointer: 0,
+                emit_clock_tick: false,
+            })
+            .expect("lock update should send transport");
+
+        let connection = engine.into_midi().into_inner();
+        assert_eq!(connection.messages, vec![vec![0xF2, 0x00, 0x00], vec![0xFA]]);
     }
 
     #[test]
