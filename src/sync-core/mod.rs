@@ -62,7 +62,6 @@ impl<P: MidiTransport> SyncEngine<P> {
 
 pub struct DecodeSyncBridge<P> {
     engine: SyncEngine<P>,
-    ltc_fps: f64,
     ref_bpm: f64,
     anchor_timecode: Timecode,
     last_decoded_frame_count: u64,
@@ -70,10 +69,9 @@ pub struct DecodeSyncBridge<P> {
 }
 
 impl<P: MidiTransport> DecodeSyncBridge<P> {
-    pub fn new(engine: SyncEngine<P>, ref_bpm: f64, ltc_fps: f64, anchor_timecode: Timecode) -> Self {
+    pub fn new(engine: SyncEngine<P>, ref_bpm: f64, anchor_timecode: Timecode) -> Self {
         Self {
             engine,
-            ltc_fps,
             ref_bpm,
             anchor_timecode,
             last_decoded_frame_count: 0,
@@ -91,13 +89,27 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
             .saturating_sub(self.last_decoded_frame_count);
         self.last_decoded_frame_count = status.decoded_frame_count;
 
-        self.clock_accumulator += new_frames as f64 * self.clocks_per_frame();
+        if status.direction == PlaybackDirection::Reverse {
+            self.clock_accumulator = 0.0;
+            self.engine.apply_update(SyncUpdate {
+                lock_status: status.lock_status,
+                direction: status.direction,
+                song_position_pointer: 0,
+                emit_clock_tick: false,
+            })?;
+            return Ok(());
+        }
+
+        let measured_fps = status.measured_fps.unwrap_or(0.0);
+        let smoothed_tempo_bpm = status.smoothed_tempo_bpm.unwrap_or(self.ref_bpm);
+        self.clock_accumulator +=
+            clocks_for_frame_delta(new_frames, measured_fps, smoothed_tempo_bpm);
         let mut clock_ticks = self.clock_accumulator.floor() as u32;
         self.clock_accumulator -= clock_ticks as f64;
 
         let song_position_pointer = status
             .current_timecode
-            .map(|timecode| self.song_position_pointer(timecode))
+            .map(|timecode| self.song_position_pointer(timecode, measured_fps))
             .unwrap_or(0);
 
         self.engine.apply_update(SyncUpdate {
@@ -120,16 +132,26 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
         Ok(())
     }
 
-    fn clocks_per_frame(&self) -> f64 {
-        (self.ref_bpm * 24.0 / 60.0) / self.ltc_fps
-    }
-
-    fn song_position_pointer(&self, timecode: Timecode) -> u16 {
-        let seconds = timecode_seconds(timecode, self.ltc_fps) - timecode_seconds(self.anchor_timecode, self.ltc_fps);
+    fn song_position_pointer(&self, timecode: Timecode, measured_fps: f64) -> u16 {
+        let fps = if measured_fps > 0.0 {
+            measured_fps
+        } else {
+            30.0
+        };
+        let seconds = timecode_seconds(timecode, fps) - timecode_seconds(self.anchor_timecode, fps);
         let beats = seconds.max(0.0) * self.ref_bpm / 60.0;
         let spp = (beats * 4.0).floor();
         spp.clamp(0.0, 0x3FFF as f64) as u16
     }
+}
+
+fn clocks_for_frame_delta(frame_delta: u64, measured_fps: f64, smoothed_tempo_bpm: f64) -> f64 {
+    if frame_delta == 0 || measured_fps <= 0.0 || smoothed_tempo_bpm <= 0.0 {
+        return 0.0;
+    }
+
+    let elapsed_seconds = frame_delta as f64 / measured_fps;
+    elapsed_seconds * (smoothed_tempo_bpm * 24.0 / 60.0)
 }
 
 impl<P: MidiTransport> DecodeStatusHandler for DecodeSyncBridge<P> {
@@ -241,7 +263,6 @@ mod tests {
         let mut bridge = DecodeSyncBridge::new(
             engine(),
             120.0,
-            30.0,
             Timecode {
                 hours: 1,
                 minutes: 0,
@@ -263,9 +284,45 @@ mod tests {
                 frames: 15,
             }),
             decoded_frame_count: 15,
+            measured_fps: Some(30.0),
+            smoothed_tempo_bpm: Some(120.0),
         }).expect("bridge should emit updates");
 
         let connection = bridge.into_engine().into_midi().into_inner();
         assert!(connection.messages.iter().any(|message| message == &vec![0xF8]));
+    }
+
+    #[test]
+    fn decode_sync_bridge_suppresses_reverse_chase_updates() {
+        let mut bridge = DecodeSyncBridge::new(
+            engine(),
+            120.0,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+        );
+
+        bridge.handle_status_result(&DecodeStatus {
+            lock_status: LockStatus::Locked,
+            direction: PlaybackDirection::Reverse,
+            edge_count: 0,
+            consecutive_valid_windows: 8,
+            consecutive_invalid_windows: 0,
+            current_timecode: Some(Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 10,
+            }),
+            decoded_frame_count: 10,
+            measured_fps: Some(30.0),
+            smoothed_tempo_bpm: Some(120.0),
+        }).expect("reverse update should be suppressed");
+
+        let connection = bridge.into_engine().into_midi().into_inner();
+        assert!(connection.messages.is_empty());
     }
 }

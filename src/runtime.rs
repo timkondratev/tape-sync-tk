@@ -59,7 +59,6 @@ where
             let decode_status_handler = Some(make_decode_status_handler(
                 midi,
                 config.tempo.ref_bpm,
-                config.timecode.ltc_fps.as_f64(),
                 config.midi.send_clock,
                 config.midi.send_transport,
             ));
@@ -73,6 +72,9 @@ where
                         },
                         DecodeRequest {
                             fps: config.timecode.ltc_fps,
+                            ref_fps: config.tempo.ref_fps,
+                            ref_bpm: config.tempo.ref_bpm,
+                            smoothing_alpha: config.tempo.smoothing_alpha,
                         },
                         decode_status_handler,
                     )?,
@@ -93,7 +95,6 @@ where
 fn make_decode_status_handler<M>(
     midi: M,
     ref_bpm: f64,
-    ltc_fps: f64,
     send_clock: bool,
     send_transport: bool,
 ) -> SharedDecodeStatusHandler
@@ -104,7 +105,6 @@ where
     let bridge = DecodeSyncBridge::new(
         engine,
         ref_bpm,
-        ltc_fps,
         Timecode {
             hours: 1,
             minutes: 0,

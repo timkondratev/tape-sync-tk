@@ -46,7 +46,7 @@ pub fn open_input_stream(
     )?;
     let config = supported_to_stream_config(&supported, sample_rate);
     let decode_status = Arc::new(Mutex::new(DecodeStatus::default()));
-    let decode_monitor = Arc::new(Mutex::new(DecodeMonitor::new(sample_rate, decode_request.fps)));
+    let decode_monitor = Arc::new(Mutex::new(DecodeMonitor::new(decode_request, sample_rate)));
     let stream = build_input_stream(
         &device,
         &config,

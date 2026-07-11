@@ -42,7 +42,7 @@ pub struct EdgeEvent {
     pub direction: EdgeDirection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodeStatus {
     pub lock_status: LockStatus,
     pub direction: PlaybackDirection,
@@ -51,6 +51,8 @@ pub struct DecodeStatus {
     pub consecutive_invalid_windows: u32,
     pub current_timecode: Option<Timecode>,
     pub decoded_frame_count: u64,
+    pub measured_fps: Option<f64>,
+    pub smoothed_tempo_bpm: Option<f64>,
 }
 
 impl Default for DecodeStatus {
@@ -63,6 +65,8 @@ impl Default for DecodeStatus {
             consecutive_invalid_windows: 0,
             current_timecode: None,
             decoded_frame_count: 0,
+            measured_fps: None,
+            smoothed_tempo_bpm: None,
         }
     }
 }
@@ -167,6 +171,9 @@ pub struct GeneratorRequest<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeRequest {
     pub fps: Fps,
+    pub ref_fps: Fps,
+    pub ref_bpm: f64,
+    pub smoothing_alpha: f64,
 }
 
 #[derive(Debug)]
@@ -351,6 +358,8 @@ impl LockTracker {
             consecutive_invalid_windows: self.consecutive_invalid_windows,
             current_timecode: None,
             decoded_frame_count: 0,
+            measured_fps: None,
+            smoothed_tempo_bpm: None,
         }
     }
 }
@@ -360,20 +369,38 @@ pub struct DecodeMonitor {
     edge_detector: EdgeDetector,
     frame_decoder: FrameDecoder,
     lock_tracker: LockTracker,
+    fps: Fps,
+    ref_fps: Fps,
+    ref_bpm: f64,
+    smoothing_alpha: f64,
+    sample_rate: u32,
     sample_offset: usize,
     decoded_frame_count: u64,
     last_timecode: Option<Timecode>,
+    previous_frame_sample: Option<usize>,
+    measured_fps: Option<f64>,
+    smoothed_tempo_bpm: Option<f64>,
+    direction: PlaybackDirection,
 }
 
 impl DecodeMonitor {
-    pub fn new(sample_rate: u32, fps: Fps) -> Self {
+    pub fn new(request: DecodeRequest, sample_rate: u32) -> Self {
         Self {
             edge_detector: EdgeDetector::default(),
-            frame_decoder: FrameDecoder::new(sample_rate, fps),
+            frame_decoder: FrameDecoder::new(sample_rate, request.fps),
             lock_tracker: LockTracker::default(),
+            fps: request.fps,
+            ref_fps: request.ref_fps,
+            ref_bpm: request.ref_bpm,
+            smoothing_alpha: request.smoothing_alpha,
+            sample_rate,
             sample_offset: 0,
             decoded_frame_count: 0,
             last_timecode: None,
+            previous_frame_sample: None,
+            measured_fps: None,
+            smoothed_tempo_bpm: None,
+            direction: PlaybackDirection::Forward,
         }
     }
 
@@ -383,6 +410,8 @@ impl DecodeMonitor {
         for edge in &edges {
             if let Some(bits) = self.frame_decoder.push_edge(self.sample_offset + edge.sample_index) {
                 if let Ok(timecode) = decode_timecode(bits) {
+                    let frame_sample = self.sample_offset + edge.sample_index;
+                    self.update_timing_metrics(timecode, frame_sample);
                     self.decoded_frame_count += 1;
                     self.last_timecode = Some(timecode);
                     decoded_timecode = Some(timecode);
@@ -394,16 +423,69 @@ impl DecodeMonitor {
 
         let mut status = self.lock_tracker.observe_window(decoded_timecode.is_some());
         status.edge_count = edges.len();
+        status.direction = self.direction;
         status.current_timecode = self.last_timecode;
         status.decoded_frame_count = self.decoded_frame_count;
+        status.measured_fps = self.measured_fps;
+        status.smoothed_tempo_bpm = self.smoothed_tempo_bpm;
         status
+    }
+
+    fn update_timing_metrics(&mut self, current_timecode: Timecode, frame_sample: usize) {
+        if let Some(previous_timecode) = self.last_timecode {
+            self.direction = infer_direction(previous_timecode, current_timecode, self.fps);
+        }
+
+        if let Some(previous_frame_sample) = self.previous_frame_sample {
+            let sample_delta = frame_sample.saturating_sub(previous_frame_sample);
+            if sample_delta > 0 {
+                let measured_fps = self.sample_rate as f64 / sample_delta as f64;
+                self.measured_fps = Some(measured_fps);
+
+                let measured_tempo_bpm = self.ref_bpm * (measured_fps / self.ref_fps.as_f64());
+                self.smoothed_tempo_bpm = Some(match self.smoothed_tempo_bpm {
+                    Some(previous) => {
+                        previous + self.smoothing_alpha * (measured_tempo_bpm - previous)
+                    }
+                    None => measured_tempo_bpm,
+                });
+            }
+        }
+
+        self.previous_frame_sample = Some(frame_sample);
     }
 }
 
 impl Default for DecodeMonitor {
     fn default() -> Self {
-        Self::new(44_100, Fps::Fps30)
+        Self::new(
+            DecodeRequest {
+                fps: Fps::Fps30,
+                ref_fps: Fps::Fps30,
+                ref_bpm: 120.0,
+                smoothing_alpha: 0.15,
+            },
+            44_100,
+        )
     }
+}
+
+fn infer_direction(previous: Timecode, current: Timecode, fps: Fps) -> PlaybackDirection {
+    if current == previous.increment(fps) {
+        PlaybackDirection::Forward
+    } else if previous == current.increment(fps) {
+        PlaybackDirection::Reverse
+    } else if total_frames(current, fps) >= total_frames(previous, fps) {
+        PlaybackDirection::Forward
+    } else {
+        PlaybackDirection::Reverse
+    }
+}
+
+fn total_frames(timecode: Timecode, fps: Fps) -> i64 {
+    (((timecode.hours as i64 * 60 + timecode.minutes as i64) * 60 + timecode.seconds as i64)
+        * fps.frame_count_base() as i64)
+        + timecode.frames as i64
 }
 
 fn decode_timecode(bits: [bool; 80]) -> Result<Timecode, LtcError> {
@@ -648,7 +730,15 @@ mod tests {
 
     #[test]
     fn decode_monitor_counts_edges_in_active_window() {
-        let mut monitor = DecodeMonitor::new(44_100, Fps::Fps30);
+        let mut monitor = DecodeMonitor::new(
+            DecodeRequest {
+                fps: Fps::Fps30,
+                ref_fps: Fps::Fps30,
+                ref_bpm: 120.0,
+                smoothing_alpha: 0.15,
+            },
+            44_100,
+        );
         let status = monitor.process_samples(&[-0.5, 0.5, -0.5, 0.5]);
 
         assert_eq!(status.lock_status, LockStatus::Unlocked);
@@ -665,7 +755,15 @@ mod tests {
             44_100,
         )
         .expect("generator should initialize");
-        let mut monitor = DecodeMonitor::new(44_100, Fps::Fps30);
+        let mut monitor = DecodeMonitor::new(
+            DecodeRequest {
+                fps: Fps::Fps30,
+                ref_fps: Fps::Fps30,
+                ref_bpm: 120.0,
+                smoothing_alpha: 0.15,
+            },
+            44_100,
+        );
 
         let mut final_status = DecodeStatus::default();
         for _ in 0..60 {
@@ -677,9 +775,29 @@ mod tests {
 
         assert!(final_status.decoded_frame_count > 0);
         assert!(final_status.current_timecode.is_some());
+        assert!(final_status.measured_fps.is_some());
+        assert!(final_status.smoothed_tempo_bpm.is_some());
         assert!(matches!(
             final_status.lock_status,
             LockStatus::Locking | LockStatus::Locked
         ));
+    }
+
+    #[test]
+    fn infers_reverse_direction_for_previous_frame() {
+        let previous = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 1,
+        };
+        let current = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
+
+        assert_eq!(infer_direction(previous, current, Fps::Fps30), PlaybackDirection::Reverse);
     }
 }
