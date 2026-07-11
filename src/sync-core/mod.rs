@@ -64,18 +64,27 @@ pub struct DecodeSyncBridge<P> {
     engine: SyncEngine<P>,
     ref_bpm: f64,
     anchor_timecode: Timecode,
+    latency_ms: f64,
     last_decoded_frame_count: u64,
     clock_accumulator: f64,
+    last_lock_status: LockStatus,
 }
 
 impl<P: MidiTransport> DecodeSyncBridge<P> {
-    pub fn new(engine: SyncEngine<P>, ref_bpm: f64, anchor_timecode: Timecode) -> Self {
+    pub fn new(
+        engine: SyncEngine<P>,
+        ref_bpm: f64,
+        anchor_timecode: Timecode,
+        latency_ms: f64,
+    ) -> Self {
         Self {
             engine,
             ref_bpm,
             anchor_timecode,
+            latency_ms,
             last_decoded_frame_count: 0,
             clock_accumulator: 0.0,
+            last_lock_status: LockStatus::Unlocked,
         }
     }
 
@@ -88,9 +97,12 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
             .decoded_frame_count
             .saturating_sub(self.last_decoded_frame_count);
         self.last_decoded_frame_count = status.decoded_frame_count;
+        let lock_acquisition = self.last_lock_status != LockStatus::Locked
+            && status.lock_status == LockStatus::Locked;
 
         if status.direction == PlaybackDirection::Reverse {
             self.clock_accumulator = 0.0;
+            self.last_lock_status = status.lock_status;
             self.engine.apply_update(SyncUpdate {
                 lock_status: status.lock_status,
                 direction: status.direction,
@@ -102,6 +114,11 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
 
         let measured_fps = status.measured_fps.unwrap_or(0.0);
         let smoothed_tempo_bpm = status.smoothed_tempo_bpm.unwrap_or(self.ref_bpm);
+
+        if lock_acquisition {
+            self.clock_accumulator = latency_phase(self.latency_ms, smoothed_tempo_bpm);
+        }
+
         self.clock_accumulator +=
             clocks_for_frame_delta(new_frames, measured_fps, smoothed_tempo_bpm);
         let mut clock_ticks = self.clock_accumulator.floor() as u32;
@@ -118,6 +135,8 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
             song_position_pointer,
             emit_clock_tick: clock_ticks > 0,
         })?;
+
+        self.last_lock_status = status.lock_status;
 
         while clock_ticks > 1 {
             self.engine.apply_update(SyncUpdate {
@@ -138,11 +157,22 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
         } else {
             30.0
         };
-        let seconds = timecode_seconds(timecode, fps) - timecode_seconds(self.anchor_timecode, fps);
+        let seconds = timecode_seconds(timecode, fps)
+            + self.latency_ms / 1000.0
+            - timecode_seconds(self.anchor_timecode, fps);
         let beats = seconds.max(0.0) * self.ref_bpm / 60.0;
         let spp = (beats * 4.0).floor();
         spp.clamp(0.0, 0x3FFF as f64) as u16
     }
+}
+
+fn latency_phase(latency_ms: f64, tempo_bpm: f64) -> f64 {
+    if latency_ms == 0.0 || tempo_bpm <= 0.0 {
+        return 0.0;
+    }
+
+    let latency_clocks = (latency_ms / 1000.0) * (tempo_bpm * 24.0 / 60.0);
+    (-latency_clocks).rem_euclid(1.0)
 }
 
 fn clocks_for_frame_delta(frame_delta: u64, measured_fps: f64, smoothed_tempo_bpm: f64) -> f64 {
@@ -269,6 +299,7 @@ mod tests {
                 seconds: 0,
                 frames: 0,
             },
+            500.0,
         );
 
         bridge.handle_status_result(&DecodeStatus {
@@ -289,6 +320,7 @@ mod tests {
         }).expect("bridge should emit updates");
 
         let connection = bridge.into_engine().into_midi().into_inner();
+        assert_eq!(connection.messages.first(), Some(&vec![0xF2, 0x08, 0x00]));
         assert!(connection.messages.iter().any(|message| message == &vec![0xF8]));
     }
 
@@ -303,6 +335,7 @@ mod tests {
                 seconds: 0,
                 frames: 0,
             },
+            500.0,
         );
 
         bridge.handle_status_result(&DecodeStatus {

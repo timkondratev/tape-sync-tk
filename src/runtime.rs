@@ -71,6 +71,7 @@ where
             let decode_status_handler = Some(make_decode_status_handler(
                 midi,
                 config.tempo.ref_bpm,
+                config.total_latency_ms(),
                 config.midi.send_clock,
                 config.midi.send_transport,
             ));
@@ -109,6 +110,7 @@ where
 fn make_decode_status_handler<M>(
     midi: M,
     ref_bpm: f64,
+    latency_ms: f64,
     send_clock: bool,
     send_transport: bool,
 ) -> SharedDecodeStatusHandler
@@ -125,6 +127,7 @@ where
             seconds: 0,
             frames: 0,
         },
+        latency_ms,
     );
     Arc::new(Mutex::new(Box::new(bridge)))
 }

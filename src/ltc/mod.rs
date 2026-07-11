@@ -1,4 +1,5 @@
 use crate::config::Fps;
+use std::f32::consts::PI;
 use std::fmt;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -205,8 +206,44 @@ pub struct EdgeDetector {
 struct FrameDecoder {
     expected_half_bit_samples: f64,
     last_edge_sample: Option<usize>,
+    last_edge_direction: Option<EdgeDirection>,
     pending_short_interval: bool,
     bits: Vec<bool>,
+}
+
+#[derive(Debug)]
+struct LtcPreFilter {
+    alpha: f32,
+    previous_input: f32,
+    previous_output: f32,
+}
+
+impl LtcPreFilter {
+    fn new(sample_rate: u32) -> Self {
+        let sample_rate = sample_rate.max(1) as f32;
+        let cutoff_hz = 20.0;
+        let dt = 1.0 / sample_rate;
+        let rc = 1.0 / (2.0 * PI * cutoff_hz);
+        let alpha = rc / (rc + dt);
+
+        Self {
+            alpha,
+            previous_input: 0.0,
+            previous_output: 0.0,
+        }
+    }
+
+    fn process(&mut self, samples: &[f32]) -> Vec<f32> {
+        let mut filtered = Vec::with_capacity(samples.len());
+        for sample in samples.iter().copied() {
+            let output = self.alpha * (self.previous_output + sample - self.previous_input);
+            self.previous_input = sample;
+            self.previous_output = output;
+            filtered.push(output);
+        }
+
+        filtered
+    }
 }
 
 impl FrameDecoder {
@@ -214,17 +251,24 @@ impl FrameDecoder {
         Self {
             expected_half_bit_samples: sample_rate as f64 / (fps.as_f64() * 160.0),
             last_edge_sample: None,
+            last_edge_direction: None,
             pending_short_interval: false,
             bits: Vec::with_capacity(96),
         }
     }
 
-    fn push_edge(&mut self, edge_sample: usize) -> Option<[bool; 80]> {
+    fn push_edge(&mut self, edge_sample: usize, direction: EdgeDirection) -> Option<[bool; 80]> {
+        if self.last_edge_direction == Some(direction) {
+            self.reset_timing();
+            return None;
+        }
+
+        self.last_edge_direction = Some(direction);
         let previous_edge = self.last_edge_sample.replace(edge_sample)?;
         let interval = edge_sample.saturating_sub(previous_edge) as f64;
         let short_distance = (interval - self.expected_half_bit_samples).abs();
         let long_distance = (interval - self.expected_half_bit_samples * 2.0).abs();
-        let tolerance = self.expected_half_bit_samples * 0.45;
+        let tolerance = self.expected_half_bit_samples * 0.25;
 
         if short_distance <= tolerance {
             if self.pending_short_interval {
@@ -240,9 +284,15 @@ impl FrameDecoder {
             return self.push_bit(false);
         }
 
+        self.reset_timing();
+        None
+    }
+
+    fn reset_timing(&mut self) {
+        self.last_edge_sample = None;
+        self.last_edge_direction = None;
         self.pending_short_interval = false;
         self.bits.clear();
-        None
     }
 
     fn push_bit(&mut self, bit: bool) -> Option<[bool; 80]> {
@@ -373,6 +423,7 @@ impl LockTracker {
 #[derive(Debug)]
 pub struct DecodeMonitor {
     edge_detector: EdgeDetector,
+    pre_filter: LtcPreFilter,
     frame_decoder: FrameDecoder,
     lock_tracker: LockTracker,
     fps: Fps,
@@ -397,6 +448,7 @@ impl DecodeMonitor {
     pub fn new(request: DecodeRequest, sample_rate: u32) -> Self {
         Self {
             edge_detector: EdgeDetector::default(),
+            pre_filter: LtcPreFilter::new(sample_rate),
             frame_decoder: FrameDecoder::new(sample_rate, request.fps),
             lock_tracker: LockTracker::default(),
             fps: request.fps,
@@ -419,11 +471,15 @@ impl DecodeMonitor {
     }
 
     pub fn process_samples(&mut self, samples: &[f32]) -> DecodeStatus {
-        let edges = self.edge_detector.detect(samples);
+        let filtered_samples = self.pre_filter.process(samples);
+        let edges = self.edge_detector.detect(&filtered_samples);
         let mut decoded_timecode = None;
         for edge in &edges {
-            if let Some(bits) = self.frame_decoder.push_edge(self.sample_offset + edge.sample_index) {
-                if let Ok(timecode) = decode_timecode(bits) {
+            if let Some(bits) = self
+                .frame_decoder
+                .push_edge(self.sample_offset + edge.sample_index, edge.direction)
+            {
+                if let Ok(timecode) = decode_timecode(bits, self.fps) {
                     let frame_sample = self.sample_offset + edge.sample_index;
                     self.update_timing_metrics(timecode, frame_sample);
                     self.decoded_frame_count += 1;
@@ -522,18 +578,43 @@ fn total_frames(timecode: Timecode, fps: Fps) -> i64 {
         + timecode.frames as i64
 }
 
-fn decode_timecode(bits: [bool; 80]) -> Result<Timecode, LtcError> {
+fn decode_timecode(bits: [bool; 80], fps: Fps) -> Result<Timecode, LtcError> {
     if bits[64..80] != SYNC_WORD {
         return Err(LtcError::InvalidFrame("missing sync word".to_string()));
     }
 
-    let frames = decode_bcd(&bits, 0, 4) + decode_bcd(&bits, 8, 2) * 10;
-    let seconds = decode_bcd(&bits, 16, 4) + decode_bcd(&bits, 24, 3) * 10;
-    let minutes = decode_bcd(&bits, 32, 4) + decode_bcd(&bits, 40, 3) * 10;
-    let hours = decode_bcd(&bits, 48, 4) + decode_bcd(&bits, 56, 2) * 10;
+    let frame_units = decode_bcd(&bits, 0, 4);
+    let frame_tens = decode_bcd(&bits, 8, 2);
+    let second_units = decode_bcd(&bits, 16, 4);
+    let second_tens = decode_bcd(&bits, 24, 3);
+    let minute_units = decode_bcd(&bits, 32, 4);
+    let minute_tens = decode_bcd(&bits, 40, 3);
+    let hour_units = decode_bcd(&bits, 48, 4);
+    let hour_tens = decode_bcd(&bits, 56, 2);
+
+    validate_bcd_digit(frame_units, 9, "frame units")?;
+    validate_bcd_digit(frame_tens, 2, "frame tens")?;
+    validate_bcd_digit(second_units, 9, "second units")?;
+    validate_bcd_digit(second_tens, 5, "second tens")?;
+    validate_bcd_digit(minute_units, 9, "minute units")?;
+    validate_bcd_digit(minute_tens, 5, "minute tens")?;
+    validate_bcd_digit(hour_units, 9, "hour units")?;
+    validate_bcd_digit(hour_tens, 2, "hour tens")?;
+
+    let frames = frame_units + frame_tens * 10;
+    let seconds = second_units + second_tens * 10;
+    let minutes = minute_units + minute_tens * 10;
+    let hours = hour_units + hour_tens * 10;
 
     if hours >= 24 || minutes >= 60 || seconds >= 60 {
         return Err(LtcError::InvalidFrame("decoded BCD fields are out of range".to_string()));
+    }
+
+    if frames >= fps.frame_count_base() {
+        return Err(LtcError::InvalidFrame(format!(
+            "decoded frame value {frames} is out of range for {} fps",
+            fps.as_f64()
+        )));
     }
 
     Ok(Timecode {
@@ -552,6 +633,16 @@ fn decode_bcd(bits: &[bool; 80], offset: usize, width: usize) -> u8 {
         }
     }
     value
+}
+
+fn validate_bcd_digit(value: u8, maximum: u8, field: &'static str) -> Result<(), LtcError> {
+    if value > maximum {
+        return Err(LtcError::InvalidFrame(format!(
+            "{field} digit {value} is out of range"
+        )));
+    }
+
+    Ok(())
 }
 
 impl LtcGenerator {
@@ -753,6 +844,21 @@ mod tests {
     }
 
     #[test]
+    fn frame_decoder_rejects_repeated_edge_direction_glitches() {
+        let mut decoder = FrameDecoder::new(44_100, Fps::Fps30);
+
+        assert!(decoder.push_edge(0, EdgeDirection::Rising).is_none());
+        assert!(decoder.push_edge(11, EdgeDirection::Falling).is_none());
+        assert!(decoder.pending_short_interval);
+
+        assert!(decoder.push_edge(22, EdgeDirection::Falling).is_none());
+        assert!(!decoder.pending_short_interval);
+        assert!(decoder.bits.is_empty());
+        assert!(decoder.last_edge_sample.is_none());
+        assert!(decoder.last_edge_direction.is_none());
+    }
+
+    #[test]
     fn lock_tracker_transitions_to_locked_and_back() {
         let mut tracker = LockTracker::new(2, 2);
 
@@ -875,5 +981,36 @@ mod tests {
 
         assert!(monitor.measured_fps.is_none());
         assert!(monitor.smoothed_tempo_bpm.is_none());
+    }
+
+    #[test]
+    fn decode_timecode_rejects_frame_values_out_of_range_for_fps() {
+        let bits = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 29,
+        }
+        .encode_ltc_bits(Fps::Fps30);
+
+        let error = decode_timecode(bits, Fps::Fps24).expect_err("frame should be rejected");
+        assert!(error.to_string().contains("out of range for 24 fps"));
+    }
+
+    #[test]
+    fn decode_timecode_rejects_invalid_bcd_digits() {
+        let mut bits = Timecode {
+            hours: 1,
+            minutes: 2,
+            seconds: 3,
+            frames: 4,
+        }
+        .encode_ltc_bits(Fps::Fps30);
+
+        bits[1] = true;
+        bits[3] = true;
+
+        let error = decode_timecode(bits, Fps::Fps30).expect_err("invalid BCD should fail");
+        assert!(error.to_string().contains("frame units digit"));
     }
 }
