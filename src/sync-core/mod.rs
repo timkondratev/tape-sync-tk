@@ -1,0 +1,271 @@
+use crate::ltc::{DecodeStatus, DecodeStatusHandler, LockStatus, PlaybackDirection, Timecode};
+use crate::midi::MidiTransport;
+use crate::runtime::RuntimeError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncUpdate {
+    pub lock_status: LockStatus,
+    pub direction: PlaybackDirection,
+    pub song_position_pointer: u16,
+    pub emit_clock_tick: bool,
+}
+
+pub struct SyncEngine<P> {
+    midi: P,
+    send_clock: bool,
+    send_transport: bool,
+    last_lock_status: LockStatus,
+}
+
+impl<P: MidiTransport> SyncEngine<P> {
+    pub fn new(midi: P, send_clock: bool, send_transport: bool) -> Self {
+        Self {
+            midi,
+            send_clock,
+            send_transport,
+            last_lock_status: LockStatus::Unlocked,
+        }
+    }
+
+    pub fn apply_update(&mut self, update: SyncUpdate) -> Result<(), RuntimeError> {
+        let forward = update.direction == PlaybackDirection::Forward;
+
+        if self.send_transport
+            && forward
+            && self.last_lock_status != LockStatus::Locked
+            && update.lock_status == LockStatus::Locked
+        {
+            self.midi
+                .send_song_position_pointer(update.song_position_pointer)?;
+            self.midi.send_start()?;
+        }
+
+        if self.send_transport
+            && self.last_lock_status == LockStatus::Locked
+            && update.lock_status == LockStatus::Unlocked
+        {
+            self.midi.send_stop()?;
+        }
+
+        if self.send_clock && forward && update.lock_status == LockStatus::Locked && update.emit_clock_tick {
+            self.midi.send_clock()?;
+        }
+
+        self.last_lock_status = update.lock_status;
+        Ok(())
+    }
+
+    pub fn into_midi(self) -> P {
+        self.midi
+    }
+}
+
+pub struct DecodeSyncBridge<P> {
+    engine: SyncEngine<P>,
+    ltc_fps: f64,
+    ref_bpm: f64,
+    anchor_timecode: Timecode,
+    last_decoded_frame_count: u64,
+    clock_accumulator: f64,
+}
+
+impl<P: MidiTransport> DecodeSyncBridge<P> {
+    pub fn new(engine: SyncEngine<P>, ref_bpm: f64, ltc_fps: f64, anchor_timecode: Timecode) -> Self {
+        Self {
+            engine,
+            ltc_fps,
+            ref_bpm,
+            anchor_timecode,
+            last_decoded_frame_count: 0,
+            clock_accumulator: 0.0,
+        }
+    }
+
+    pub fn into_engine(self) -> SyncEngine<P> {
+        self.engine
+    }
+
+    fn handle_status_result(&mut self, status: &DecodeStatus) -> Result<(), RuntimeError> {
+        let new_frames = status
+            .decoded_frame_count
+            .saturating_sub(self.last_decoded_frame_count);
+        self.last_decoded_frame_count = status.decoded_frame_count;
+
+        self.clock_accumulator += new_frames as f64 * self.clocks_per_frame();
+        let mut clock_ticks = self.clock_accumulator.floor() as u32;
+        self.clock_accumulator -= clock_ticks as f64;
+
+        let song_position_pointer = status
+            .current_timecode
+            .map(|timecode| self.song_position_pointer(timecode))
+            .unwrap_or(0);
+
+        self.engine.apply_update(SyncUpdate {
+            lock_status: status.lock_status,
+            direction: status.direction,
+            song_position_pointer,
+            emit_clock_tick: clock_ticks > 0,
+        })?;
+
+        while clock_ticks > 1 {
+            self.engine.apply_update(SyncUpdate {
+                lock_status: status.lock_status,
+                direction: status.direction,
+                song_position_pointer,
+                emit_clock_tick: true,
+            })?;
+            clock_ticks -= 1;
+        }
+
+        Ok(())
+    }
+
+    fn clocks_per_frame(&self) -> f64 {
+        (self.ref_bpm * 24.0 / 60.0) / self.ltc_fps
+    }
+
+    fn song_position_pointer(&self, timecode: Timecode) -> u16 {
+        let seconds = timecode_seconds(timecode, self.ltc_fps) - timecode_seconds(self.anchor_timecode, self.ltc_fps);
+        let beats = seconds.max(0.0) * self.ref_bpm / 60.0;
+        let spp = (beats * 4.0).floor();
+        spp.clamp(0.0, 0x3FFF as f64) as u16
+    }
+}
+
+impl<P: MidiTransport> DecodeStatusHandler for DecodeSyncBridge<P> {
+    fn handle_status(&mut self, status: &DecodeStatus) {
+        let _ = self.handle_status_result(status);
+    }
+}
+
+fn timecode_seconds(timecode: Timecode, ltc_fps: f64) -> f64 {
+    ((timecode.hours as f64 * 60.0 + timecode.minutes as f64) * 60.0 + timecode.seconds as f64)
+        + timecode.frames as f64 / ltc_fps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::midi::{MidiOutputPort, MidiSink};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeConnection {
+        messages: Vec<Vec<u8>>,
+    }
+
+    impl MidiSink for FakeConnection {
+        fn send(&mut self, message: &[u8]) -> Result<(), String> {
+            self.messages.push(message.to_vec());
+            Ok(())
+        }
+    }
+
+    fn engine() -> SyncEngine<MidiOutputPort<FakeConnection>> {
+        SyncEngine::new(
+            MidiOutputPort::new(
+                "TapeSync MIDI Out".to_string(),
+                FakeConnection { messages: Vec::new() },
+            ),
+            true,
+            true,
+        )
+    }
+
+    #[test]
+    fn sends_spp_then_start_on_lock() {
+        let mut engine = engine();
+
+        engine
+            .apply_update(SyncUpdate {
+                lock_status: LockStatus::Locked,
+                direction: PlaybackDirection::Forward,
+                song_position_pointer: 0x1234,
+                emit_clock_tick: false,
+            })
+            .expect("lock update should send transport");
+
+        let connection = engine.into_midi().into_inner();
+        assert_eq!(connection.messages, vec![vec![0xF2, 0x34, 0x24], vec![0xFA]]);
+    }
+
+    #[test]
+    fn sends_stop_on_unlock() {
+        let mut engine = engine();
+        engine
+            .apply_update(SyncUpdate {
+                lock_status: LockStatus::Locked,
+                direction: PlaybackDirection::Forward,
+                song_position_pointer: 0,
+                emit_clock_tick: false,
+            })
+            .expect("lock update should succeed");
+        engine
+            .apply_update(SyncUpdate {
+                lock_status: LockStatus::Unlocked,
+                direction: PlaybackDirection::Forward,
+                song_position_pointer: 0,
+                emit_clock_tick: false,
+            })
+            .expect("unlock update should send stop");
+
+        let connection = engine.into_midi().into_inner();
+        assert_eq!(connection.messages.last(), Some(&vec![0xFC]));
+    }
+
+    #[test]
+    fn sends_clock_only_when_locked_and_forward() {
+        let mut engine = engine();
+        engine
+            .apply_update(SyncUpdate {
+                lock_status: LockStatus::Locked,
+                direction: PlaybackDirection::Forward,
+                song_position_pointer: 0,
+                emit_clock_tick: true,
+            })
+            .expect("clock update should succeed");
+        engine
+            .apply_update(SyncUpdate {
+                lock_status: LockStatus::Locked,
+                direction: PlaybackDirection::Reverse,
+                song_position_pointer: 0,
+                emit_clock_tick: true,
+            })
+            .expect("reverse update should be suppressed, not fail");
+
+        let connection = engine.into_midi().into_inner();
+        assert_eq!(connection.messages, vec![vec![0xF2, 0x00, 0x00], vec![0xFA], vec![0xF8]]);
+    }
+
+    #[test]
+    fn decode_sync_bridge_emits_clock_from_frame_progress() {
+        let mut bridge = DecodeSyncBridge::new(
+            engine(),
+            120.0,
+            30.0,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+        );
+
+        bridge.handle_status_result(&DecodeStatus {
+            lock_status: LockStatus::Locked,
+            direction: PlaybackDirection::Forward,
+            edge_count: 0,
+            consecutive_valid_windows: 8,
+            consecutive_invalid_windows: 0,
+            current_timecode: Some(Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 15,
+            }),
+            decoded_frame_count: 15,
+        }).expect("bridge should emit updates");
+
+        let connection = bridge.into_engine().into_midi().into_inner();
+        assert!(connection.messages.iter().any(|message| message == &vec![0xF8]));
+    }
+}

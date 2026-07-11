@@ -1,19 +1,22 @@
 use crate::config::{AppConfig, Mode};
 use crate::audio::{self, AudioEndpoint, AudioRuntime};
-use crate::ltc::GeneratorRequest;
-use crate::midi::{self, MidiOutputPort};
+use crate::ltc::{DecodeRequest, GeneratorRequest, SharedDecodeStatusHandler, Timecode};
+use crate::midi::{self, MidiOutputPort, MidiTransport};
 use crate::startup::{StartupReport, SystemInventory, preflight};
+use crate::sync_core::{DecodeSyncBridge, SyncEngine};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Stream};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 const RETRY_HINT: &str = "Fix the device or channel configuration, then try again.";
 
 #[derive(Debug)]
 pub struct StartupRuntime<A = Device, S = Stream, M = MidiOutputPort> {
     pub audio: AudioRuntime<A, S>,
-    pub midi: M,
+    pub midi_port_name: String,
     pub report: StartupReport,
+    _midi: Option<M>,
 }
 
 pub fn initialize(config: &AppConfig) -> Result<StartupRuntime, RuntimeError> {
@@ -29,30 +32,87 @@ pub fn initialize_with<B>(
 ) -> Result<StartupRuntime<B::AudioHandle, B::StreamHandle, B::MidiHandle>, RuntimeError>
 where
     B: RuntimeBackend,
+    B::MidiHandle: MidiTransport + Send + 'static,
 {
     let report = preflight(config, inventory).map_err(RuntimeError::Preflight)?;
-    let audio = match config.mode {
-        Mode::Generate => AudioRuntime::Generate {
-            output: backend.open_output(AudioRequest {
-                device_name: &config.audio.output_device,
-                sample_rate: config.audio.sample_rate,
-                channel: config.audio.output_channel,
-            }, GeneratorRequest {
-                start: &config.timecode.start,
-                fps: config.timecode.ltc_fps,
-            })?,
-        },
-        Mode::Decode => AudioRuntime::Decode {
-            input: backend.open_input(AudioRequest {
-                device_name: &config.audio.input_device,
-                sample_rate: config.audio.sample_rate,
-                channel: config.audio.input_channel,
-            })?,
-        },
-    };
-    let midi = backend.create_virtual_midi_output(&config.midi.port_name)?;
+    let midi_port_name = config.midi.port_name.clone();
+    let midi = backend.create_virtual_midi_output(&midi_port_name)?;
 
-    Ok(StartupRuntime { audio, midi, report })
+    let (audio, midi) = match config.mode {
+        Mode::Generate => (
+            AudioRuntime::Generate {
+                output: backend.open_output(
+                    AudioRequest {
+                        device_name: &config.audio.output_device,
+                        sample_rate: config.audio.sample_rate,
+                        channel: config.audio.output_channel,
+                    },
+                    GeneratorRequest {
+                        start: &config.timecode.start,
+                        fps: config.timecode.ltc_fps,
+                    },
+                )?,
+            },
+            Some(midi),
+        ),
+        Mode::Decode => {
+            let decode_status_handler = Some(make_decode_status_handler(
+                midi,
+                config.tempo.ref_bpm,
+                config.timecode.ltc_fps.as_f64(),
+                config.midi.send_clock,
+                config.midi.send_transport,
+            ));
+            (
+                AudioRuntime::Decode {
+                    input: backend.open_input(
+                        AudioRequest {
+                            device_name: &config.audio.input_device,
+                            sample_rate: config.audio.sample_rate,
+                            channel: config.audio.input_channel,
+                        },
+                        DecodeRequest {
+                            fps: config.timecode.ltc_fps,
+                        },
+                        decode_status_handler,
+                    )?,
+                },
+                None,
+            )
+        }
+    };
+
+    Ok(StartupRuntime {
+        audio,
+        midi_port_name,
+        report,
+        _midi: midi,
+    })
+}
+
+fn make_decode_status_handler<M>(
+    midi: M,
+    ref_bpm: f64,
+    ltc_fps: f64,
+    send_clock: bool,
+    send_transport: bool,
+) -> SharedDecodeStatusHandler
+where
+    M: MidiTransport + Send + 'static,
+{
+    let engine = SyncEngine::new(midi, send_clock, send_transport);
+    let bridge = DecodeSyncBridge::new(
+        engine,
+        ref_bpm,
+        ltc_fps,
+        Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        },
+    );
+    Arc::new(Mutex::new(Box::new(bridge)))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +130,8 @@ pub trait RuntimeBackend {
     fn open_input(
         &self,
         request: AudioRequest<'_>,
+        decode_request: DecodeRequest,
+        decode_status_handler: Option<SharedDecodeStatusHandler>,
     ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError>;
     fn open_output(
         &self,
@@ -89,10 +151,18 @@ impl RuntimeBackend for SystemBackend {
     fn open_input(
         &self,
         request: AudioRequest<'_>,
+        decode_request: DecodeRequest,
+        decode_status_handler: Option<SharedDecodeStatusHandler>,
     ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError> {
         let host = cpal::default_host();
         let device = find_device(&host, request.device_name)?;
-        audio::open_input_stream(device, request.sample_rate, request.channel)
+        audio::open_input_stream(
+            device,
+            request.sample_rate,
+            request.channel,
+            decode_request,
+            decode_status_handler,
+        )
     }
 
     fn open_output(
@@ -180,6 +250,7 @@ impl std::error::Error for RuntimeError {}
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::midi::MidiSink;
     use crate::startup::{AudioDeviceInfo, MidiEnvironment};
 
     #[derive(Default)]
@@ -192,11 +263,13 @@ mod tests {
     impl RuntimeBackend for FakeBackend {
         type AudioHandle = String;
         type StreamHandle = FakeStream;
-        type MidiHandle = MidiOutputPort<String>;
+        type MidiHandle = MidiOutputPort<FakeMidiConnection>;
 
         fn open_input(
             &self,
             request: AudioRequest<'_>,
+            _decode_request: DecodeRequest,
+            _decode_status_handler: Option<SharedDecodeStatusHandler>,
         ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError> {
             if self.fail_input {
                 return Err(RuntimeError::UnsupportedAudioConfiguration {
@@ -212,6 +285,9 @@ mod tests {
                 sample_rate: request.sample_rate,
                 channel: request.channel,
                 stream: FakeStream,
+                decode_status: Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ltc::DecodeStatus::default(),
+                ))),
             })
         }
 
@@ -234,6 +310,7 @@ mod tests {
                 sample_rate: request.sample_rate,
                 channel: request.channel,
                 stream: FakeStream,
+                decode_status: None,
             })
         }
 
@@ -242,12 +319,27 @@ mod tests {
                 return Err(RuntimeError::Midi("backend unavailable".to_string()));
             }
 
-            Ok(MidiOutputPort::new(port_name.to_string(), port_name.to_string()))
+            Ok(MidiOutputPort::new(
+                port_name.to_string(),
+                FakeMidiConnection { messages: Vec::new() },
+            ))
         }
     }
 
     #[derive(Debug)]
     struct FakeStream;
+
+    #[derive(Debug)]
+    struct FakeMidiConnection {
+        messages: Vec<Vec<u8>>,
+    }
+
+    impl MidiSink for FakeMidiConnection {
+        fn send(&mut self, message: &[u8]) -> Result<(), String> {
+            self.messages.push(message.to_vec());
+            Ok(())
+        }
+    }
 
     fn inventory() -> SystemInventory {
         SystemInventory {
@@ -320,7 +412,7 @@ send_transport = true
             AudioRuntime::Decode { .. } => panic!("expected generate runtime"),
         }
 
-        assert_eq!(runtime.midi.port_name, "TapeSync MIDI Out");
+        assert_eq!(runtime.midi_port_name, "TapeSync MIDI Out");
     }
 
     #[test]

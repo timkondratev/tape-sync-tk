@@ -1,5 +1,6 @@
 use crate::config::Fps;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 
 const LTC_PEAK_AMPLITUDE: f32 = 0.501_187_2;
@@ -15,6 +16,62 @@ pub struct Timecode {
     pub seconds: u8,
     pub frames: u8,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockStatus {
+    Unlocked,
+    Locking,
+    Locked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackDirection {
+    Forward,
+    Reverse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeDirection {
+    Rising,
+    Falling,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeEvent {
+    pub sample_index: usize,
+    pub direction: EdgeDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeStatus {
+    pub lock_status: LockStatus,
+    pub direction: PlaybackDirection,
+    pub edge_count: usize,
+    pub consecutive_valid_windows: u32,
+    pub consecutive_invalid_windows: u32,
+    pub current_timecode: Option<Timecode>,
+    pub decoded_frame_count: u64,
+}
+
+impl Default for DecodeStatus {
+    fn default() -> Self {
+        Self {
+            lock_status: LockStatus::Unlocked,
+            direction: PlaybackDirection::Forward,
+            edge_count: 0,
+            consecutive_valid_windows: 0,
+            consecutive_invalid_windows: 0,
+            current_timecode: None,
+            decoded_frame_count: 0,
+        }
+    }
+}
+
+pub trait DecodeStatusHandler: Send {
+    fn handle_status(&mut self, status: &DecodeStatus);
+}
+
+pub type SharedDecodeStatusHandler = Arc<Mutex<Box<dyn DecodeStatusHandler>>>;
 
 impl Timecode {
     pub fn increment(self, fps: Fps) -> Self {
@@ -107,6 +164,11 @@ pub struct GeneratorRequest<'a> {
     pub fps: Fps,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeRequest {
+    pub fps: Fps,
+}
+
 #[derive(Debug)]
 pub struct LtcGenerator {
     fps: Fps,
@@ -118,6 +180,262 @@ pub struct LtcGenerator {
     samples_per_half_bit: f64,
     fractional_samples: f64,
     samples_remaining_in_half: usize,
+}
+
+#[derive(Debug)]
+pub struct EdgeDetector {
+    last_polarity: Option<bool>,
+    deadband: f32,
+}
+
+#[derive(Debug)]
+struct FrameDecoder {
+    expected_half_bit_samples: f64,
+    last_edge_sample: Option<usize>,
+    pending_short_interval: bool,
+    bits: Vec<bool>,
+}
+
+impl FrameDecoder {
+    fn new(sample_rate: u32, fps: Fps) -> Self {
+        Self {
+            expected_half_bit_samples: sample_rate as f64 / (fps.as_f64() * 160.0),
+            last_edge_sample: None,
+            pending_short_interval: false,
+            bits: Vec::with_capacity(96),
+        }
+    }
+
+    fn push_edge(&mut self, edge_sample: usize) -> Option<[bool; 80]> {
+        let previous_edge = self.last_edge_sample.replace(edge_sample)?;
+        let interval = edge_sample.saturating_sub(previous_edge) as f64;
+        let short_distance = (interval - self.expected_half_bit_samples).abs();
+        let long_distance = (interval - self.expected_half_bit_samples * 2.0).abs();
+        let tolerance = self.expected_half_bit_samples * 0.45;
+
+        if short_distance <= tolerance {
+            if self.pending_short_interval {
+                self.pending_short_interval = false;
+                return self.push_bit(true);
+            }
+            self.pending_short_interval = true;
+            return None;
+        }
+
+        if long_distance <= tolerance {
+            self.pending_short_interval = false;
+            return self.push_bit(false);
+        }
+
+        self.pending_short_interval = false;
+        self.bits.clear();
+        None
+    }
+
+    fn push_bit(&mut self, bit: bool) -> Option<[bool; 80]> {
+        self.bits.push(bit);
+        if self.bits.len() > 80 {
+            let excess = self.bits.len() - 80;
+            self.bits.drain(0..excess);
+        }
+
+        if self.bits.len() == 80 && self.bits[64..80] == SYNC_WORD {
+            let mut frame = [false; 80];
+            frame.copy_from_slice(&self.bits[..80]);
+            return Some(frame);
+        }
+
+        None
+    }
+}
+
+impl Default for EdgeDetector {
+    fn default() -> Self {
+        Self {
+            last_polarity: None,
+            deadband: 0.01,
+        }
+    }
+}
+
+impl EdgeDetector {
+    pub fn detect(&mut self, samples: &[f32]) -> Vec<EdgeEvent> {
+        let mut edges = Vec::new();
+
+        for (sample_index, sample) in samples.iter().copied().enumerate() {
+            let polarity = if sample > self.deadband {
+                Some(true)
+            } else if sample < -self.deadband {
+                Some(false)
+            } else {
+                None
+            };
+
+            let Some(polarity) = polarity else {
+                continue;
+            };
+
+            match self.last_polarity {
+                Some(previous) if previous != polarity => {
+                    edges.push(EdgeEvent {
+                        sample_index,
+                        direction: if polarity {
+                            EdgeDirection::Rising
+                        } else {
+                            EdgeDirection::Falling
+                        },
+                    });
+                    self.last_polarity = Some(polarity);
+                }
+                None => {
+                    self.last_polarity = Some(polarity);
+                }
+                _ => {}
+            }
+        }
+
+        edges
+    }
+}
+
+#[derive(Debug)]
+pub struct LockTracker {
+    lock_threshold: u32,
+    unlock_threshold: u32,
+    lock_status: LockStatus,
+    consecutive_valid_windows: u32,
+    consecutive_invalid_windows: u32,
+}
+
+impl Default for LockTracker {
+    fn default() -> Self {
+        Self::new(8, 4)
+    }
+}
+
+impl LockTracker {
+    pub fn new(lock_threshold: u32, unlock_threshold: u32) -> Self {
+        Self {
+            lock_threshold,
+            unlock_threshold,
+            lock_status: LockStatus::Unlocked,
+            consecutive_valid_windows: 0,
+            consecutive_invalid_windows: 0,
+        }
+    }
+
+    pub fn observe_window(&mut self, has_activity: bool) -> DecodeStatus {
+        if has_activity {
+            self.consecutive_valid_windows += 1;
+            self.consecutive_invalid_windows = 0;
+            self.lock_status = match self.lock_status {
+                LockStatus::Unlocked => LockStatus::Locking,
+                LockStatus::Locking if self.consecutive_valid_windows >= self.lock_threshold => {
+                    LockStatus::Locked
+                }
+                other => other,
+            };
+        } else {
+            self.consecutive_invalid_windows += 1;
+            self.consecutive_valid_windows = 0;
+            if self.consecutive_invalid_windows >= self.unlock_threshold {
+                self.lock_status = LockStatus::Unlocked;
+            }
+        }
+
+        DecodeStatus {
+            lock_status: self.lock_status,
+            direction: PlaybackDirection::Forward,
+            edge_count: 0,
+            consecutive_valid_windows: self.consecutive_valid_windows,
+            consecutive_invalid_windows: self.consecutive_invalid_windows,
+            current_timecode: None,
+            decoded_frame_count: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DecodeMonitor {
+    edge_detector: EdgeDetector,
+    frame_decoder: FrameDecoder,
+    lock_tracker: LockTracker,
+    sample_offset: usize,
+    decoded_frame_count: u64,
+    last_timecode: Option<Timecode>,
+}
+
+impl DecodeMonitor {
+    pub fn new(sample_rate: u32, fps: Fps) -> Self {
+        Self {
+            edge_detector: EdgeDetector::default(),
+            frame_decoder: FrameDecoder::new(sample_rate, fps),
+            lock_tracker: LockTracker::default(),
+            sample_offset: 0,
+            decoded_frame_count: 0,
+            last_timecode: None,
+        }
+    }
+
+    pub fn process_samples(&mut self, samples: &[f32]) -> DecodeStatus {
+        let edges = self.edge_detector.detect(samples);
+        let mut decoded_timecode = None;
+        for edge in &edges {
+            if let Some(bits) = self.frame_decoder.push_edge(self.sample_offset + edge.sample_index) {
+                if let Ok(timecode) = decode_timecode(bits) {
+                    self.decoded_frame_count += 1;
+                    self.last_timecode = Some(timecode);
+                    decoded_timecode = Some(timecode);
+                }
+            }
+        }
+
+        self.sample_offset += samples.len();
+
+        let mut status = self.lock_tracker.observe_window(decoded_timecode.is_some());
+        status.edge_count = edges.len();
+        status.current_timecode = self.last_timecode;
+        status.decoded_frame_count = self.decoded_frame_count;
+        status
+    }
+}
+
+impl Default for DecodeMonitor {
+    fn default() -> Self {
+        Self::new(44_100, Fps::Fps30)
+    }
+}
+
+fn decode_timecode(bits: [bool; 80]) -> Result<Timecode, LtcError> {
+    if bits[64..80] != SYNC_WORD {
+        return Err(LtcError::InvalidFrame("missing sync word".to_string()));
+    }
+
+    let frames = decode_bcd(&bits, 0, 4) + decode_bcd(&bits, 8, 2) * 10;
+    let seconds = decode_bcd(&bits, 16, 4) + decode_bcd(&bits, 24, 3) * 10;
+    let minutes = decode_bcd(&bits, 32, 4) + decode_bcd(&bits, 40, 3) * 10;
+    let hours = decode_bcd(&bits, 48, 4) + decode_bcd(&bits, 56, 2) * 10;
+
+    if hours >= 24 || minutes >= 60 || seconds >= 60 {
+        return Err(LtcError::InvalidFrame("decoded BCD fields are out of range".to_string()));
+    }
+
+    Ok(Timecode {
+        hours,
+        minutes,
+        seconds,
+        frames,
+    })
+}
+
+fn decode_bcd(bits: &[bool; 80], offset: usize, width: usize) -> u8 {
+    let mut value = 0;
+    for index in 0..width {
+        if bits[offset + index] {
+            value |= 1 << index;
+        }
+    }
+    value
 }
 
 impl LtcGenerator {
@@ -198,6 +516,7 @@ impl LtcGenerator {
 pub enum LtcError {
     InvalidTimecodeFormat(String),
     FrameOutOfRange { frames: u8, fps: Fps },
+    InvalidFrame(String),
 }
 
 impl fmt::Display for LtcError {
@@ -211,6 +530,7 @@ impl fmt::Display for LtcError {
                 "timecode frame value {frames} is out of range for {} fps",
                 fps.as_f64()
             ),
+            Self::InvalidFrame(message) => write!(f, "invalid LTC frame: {message}"),
         }
     }
 }
@@ -304,5 +624,62 @@ mod tests {
                 frames: 0,
             }
         );
+    }
+
+    #[test]
+    fn edge_detector_reports_zero_crossings() {
+        let mut detector = EdgeDetector::default();
+        let edges = detector.detect(&[-0.5, -0.25, 0.3, 0.4, -0.2]);
+
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].direction, EdgeDirection::Rising);
+        assert_eq!(edges[1].direction, EdgeDirection::Falling);
+    }
+
+    #[test]
+    fn lock_tracker_transitions_to_locked_and_back() {
+        let mut tracker = LockTracker::new(2, 2);
+
+        assert_eq!(tracker.observe_window(true).lock_status, LockStatus::Locking);
+        assert_eq!(tracker.observe_window(true).lock_status, LockStatus::Locked);
+        assert_eq!(tracker.observe_window(false).lock_status, LockStatus::Locked);
+        assert_eq!(tracker.observe_window(false).lock_status, LockStatus::Unlocked);
+    }
+
+    #[test]
+    fn decode_monitor_counts_edges_in_active_window() {
+        let mut monitor = DecodeMonitor::new(44_100, Fps::Fps30);
+        let status = monitor.process_samples(&[-0.5, 0.5, -0.5, 0.5]);
+
+        assert_eq!(status.lock_status, LockStatus::Unlocked);
+        assert!(status.edge_count >= 2);
+    }
+
+    #[test]
+    fn decode_monitor_recovers_generated_frames() {
+        let mut generator = LtcGenerator::new(
+            GeneratorRequest {
+                start: "01:00:00:00",
+                fps: Fps::Fps30,
+            },
+            44_100,
+        )
+        .expect("generator should initialize");
+        let mut monitor = DecodeMonitor::new(44_100, Fps::Fps30);
+
+        let mut final_status = DecodeStatus::default();
+        for _ in 0..60 {
+            let samples = (0..256)
+                .map(|_| generator.next_sample())
+                .collect::<Vec<_>>();
+            final_status = monitor.process_samples(&samples);
+        }
+
+        assert!(final_status.decoded_frame_count > 0);
+        assert!(final_status.current_timecode.is_some());
+        assert!(matches!(
+            final_status.lock_status,
+            LockStatus::Locking | LockStatus::Locked
+        ));
     }
 }

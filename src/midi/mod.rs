@@ -16,6 +16,14 @@ pub trait MidiSink {
     fn send(&mut self, message: &[u8]) -> Result<(), String>;
 }
 
+pub trait MidiTransport: Send {
+    fn send_start(&mut self) -> Result<(), RuntimeError>;
+    fn send_stop(&mut self) -> Result<(), RuntimeError>;
+    fn send_continue(&mut self) -> Result<(), RuntimeError>;
+    fn send_clock(&mut self) -> Result<(), RuntimeError>;
+    fn send_song_position_pointer(&mut self, position: u16) -> Result<(), RuntimeError>;
+}
+
 impl MidiSink for MidiOutputConnection {
     fn send(&mut self, message: &[u8]) -> Result<(), String> {
         MidiOutputConnection::send(self, message).map_err(|source| source.to_string())
@@ -74,6 +82,31 @@ impl<C: MidiSink> MidiOutputPort<C> {
         }
 
         self.send(&[0xF2, (position & 0x7F) as u8, ((position >> 7) & 0x7F) as u8])
+    }
+}
+
+impl<C> MidiTransport for MidiOutputPort<C>
+where
+    C: MidiSink + Send,
+{
+    fn send_start(&mut self) -> Result<(), RuntimeError> {
+        MidiOutputPort::send_start(self)
+    }
+
+    fn send_stop(&mut self) -> Result<(), RuntimeError> {
+        MidiOutputPort::send_stop(self)
+    }
+
+    fn send_continue(&mut self) -> Result<(), RuntimeError> {
+        MidiOutputPort::send_continue(self)
+    }
+
+    fn send_clock(&mut self) -> Result<(), RuntimeError> {
+        MidiOutputPort::send_clock(self)
+    }
+
+    fn send_song_position_pointer(&mut self, position: u16) -> Result<(), RuntimeError> {
+        MidiOutputPort::send_song_position_pointer(self, position)
     }
 }
 

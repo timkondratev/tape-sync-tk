@@ -1,8 +1,16 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfigRange};
+use std::sync::{Arc, Mutex};
 
-use crate::ltc::{GeneratorRequest, LtcGenerator};
+use crate::ltc::{
+    DecodeMonitor, DecodeRequest, DecodeStatus, GeneratorRequest, LtcGenerator,
+    SharedDecodeStatusHandler,
+};
 use crate::runtime::RuntimeError;
+
+pub type SharedDecodeStatus = Arc<Mutex<DecodeStatus>>;
+
+type SharedDecodeMonitor = Arc<Mutex<DecodeMonitor>>;
 
 #[derive(Debug)]
 pub enum AudioRuntime<A = Device, S = Stream> {
@@ -16,12 +24,15 @@ pub struct AudioEndpoint<A, S> {
     pub sample_rate: u32,
     pub channel: u16,
     pub stream: S,
+    pub decode_status: Option<SharedDecodeStatus>,
 }
 
 pub fn open_input_stream(
     device: Device,
     sample_rate: u32,
     channel: u16,
+    decode_request: DecodeRequest,
+    decode_status_handler: Option<SharedDecodeStatusHandler>,
 ) -> Result<AudioEndpoint<Device, Stream>, RuntimeError> {
     let device_name = device_name(&device)?;
     let supported = select_supported_config(
@@ -34,7 +45,17 @@ pub fn open_input_stream(
         &device_name,
     )?;
     let config = supported_to_stream_config(&supported, sample_rate);
-    let stream = build_input_stream(&device, &config, supported.sample_format())?;
+    let decode_status = Arc::new(Mutex::new(DecodeStatus::default()));
+    let decode_monitor = Arc::new(Mutex::new(DecodeMonitor::new(sample_rate, decode_request.fps)));
+    let stream = build_input_stream(
+        &device,
+        &config,
+        supported.sample_format(),
+        channel,
+        Arc::clone(&decode_status),
+        decode_monitor,
+        decode_status_handler,
+    )?;
     stream
         .play()
         .map_err(|source| RuntimeError::AudioStream(source.to_string()))?;
@@ -44,6 +65,7 @@ pub fn open_input_stream(
         sample_rate,
         channel,
         stream,
+        decode_status: Some(decode_status),
     })
 }
 
@@ -80,6 +102,7 @@ pub fn open_output_stream(
         sample_rate,
         channel,
         stream,
+        decode_status: None,
     })
 }
 
@@ -136,19 +159,82 @@ fn build_input_stream(
     device: &Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
+    channel: u16,
+    decode_status: SharedDecodeStatus,
+    decode_monitor: SharedDecodeMonitor,
+    decode_status_handler: Option<SharedDecodeStatusHandler>,
 ) -> Result<Stream, RuntimeError> {
     let err_fn = |error| eprintln!("audio input stream error: {error}");
+    let channel_count = config.channels as usize;
+    let target_channel = channel as usize;
 
     match sample_format {
-        SampleFormat::F32 => device
-            .build_input_stream(config, move |_data: &[f32], _| {}, err_fn, None)
-            .map_err(|source| RuntimeError::AudioStream(source.to_string())),
-        SampleFormat::I16 => device
-            .build_input_stream(config, move |_data: &[i16], _| {}, err_fn, None)
-            .map_err(|source| RuntimeError::AudioStream(source.to_string())),
-        SampleFormat::U16 => device
-            .build_input_stream(config, move |_data: &[u16], _| {}, err_fn, None)
-            .map_err(|source| RuntimeError::AudioStream(source.to_string())),
+        SampleFormat::F32 => {
+            let decode_status = Arc::clone(&decode_status);
+            let decode_monitor = Arc::clone(&decode_monitor);
+            let decode_status_handler = decode_status_handler.clone();
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[f32], _| {
+                        process_f32_input(
+                            data,
+                            channel_count,
+                            target_channel,
+                            &decode_status,
+                            &decode_monitor,
+                            decode_status_handler.as_ref(),
+                        )
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|source| RuntimeError::AudioStream(source.to_string()))
+        }
+        SampleFormat::I16 => {
+            let decode_status = Arc::clone(&decode_status);
+            let decode_monitor = Arc::clone(&decode_monitor);
+            let decode_status_handler = decode_status_handler.clone();
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[i16], _| {
+                        process_i16_input(
+                            data,
+                            channel_count,
+                            target_channel,
+                            &decode_status,
+                            &decode_monitor,
+                            decode_status_handler.as_ref(),
+                        )
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|source| RuntimeError::AudioStream(source.to_string()))
+        }
+        SampleFormat::U16 => {
+            let decode_status = Arc::clone(&decode_status);
+            let decode_monitor = Arc::clone(&decode_monitor);
+            let decode_status_handler = decode_status_handler.clone();
+            device
+                .build_input_stream(
+                    config,
+                    move |data: &[u16], _| {
+                        process_u16_input(
+                            data,
+                            channel_count,
+                            target_channel,
+                            &decode_status,
+                            &decode_monitor,
+                            decode_status_handler.as_ref(),
+                        )
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|source| RuntimeError::AudioStream(source.to_string()))
+        }
         other => Err(RuntimeError::AudioStream(format!(
             "unsupported input sample format: {other:?}"
         ))),
@@ -219,6 +305,79 @@ fn render_f32_output(
             *sample = generator.next_sample();
         }
     }
+}
+
+fn process_f32_input(
+    data: &[f32],
+    channel_count: usize,
+    target_channel: usize,
+    decode_status: &SharedDecodeStatus,
+    decode_monitor: &SharedDecodeMonitor,
+    decode_status_handler: Option<&SharedDecodeStatusHandler>,
+) {
+    let selected = extract_f32_channel(data, channel_count, target_channel);
+    update_decode_status(decode_status, decode_monitor, decode_status_handler, &selected);
+}
+
+fn process_i16_input(
+    data: &[i16],
+    channel_count: usize,
+    target_channel: usize,
+    decode_status: &SharedDecodeStatus,
+    decode_monitor: &SharedDecodeMonitor,
+    decode_status_handler: Option<&SharedDecodeStatusHandler>,
+) {
+    let selected = data
+        .chunks(channel_count)
+        .filter_map(|frame| frame.get(target_channel).copied())
+        .map(|sample| sample as f32 / i16::MAX as f32)
+        .collect::<Vec<_>>();
+    update_decode_status(decode_status, decode_monitor, decode_status_handler, &selected);
+}
+
+fn process_u16_input(
+    data: &[u16],
+    channel_count: usize,
+    target_channel: usize,
+    decode_status: &SharedDecodeStatus,
+    decode_monitor: &SharedDecodeMonitor,
+    decode_status_handler: Option<&SharedDecodeStatusHandler>,
+) {
+    let selected = data
+        .chunks(channel_count)
+        .filter_map(|frame| frame.get(target_channel).copied())
+        .map(|sample| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
+        .collect::<Vec<_>>();
+    update_decode_status(decode_status, decode_monitor, decode_status_handler, &selected);
+}
+
+fn update_decode_status(
+    decode_status: &SharedDecodeStatus,
+    decode_monitor: &SharedDecodeMonitor,
+    decode_status_handler: Option<&SharedDecodeStatusHandler>,
+    samples: &[f32],
+) {
+    let status = if let Ok(mut monitor) = decode_monitor.lock() {
+        monitor.process_samples(samples)
+    } else {
+        DecodeStatus::default()
+    };
+
+    if let Ok(mut shared) = decode_status.lock() {
+        *shared = status.clone();
+    }
+
+    if let Some(handler) = decode_status_handler
+        && let Ok(mut handler) = handler.lock()
+    {
+        handler.handle_status(&status);
+    }
+}
+
+fn extract_f32_channel(data: &[f32], channel_count: usize, target_channel: usize) -> Vec<f32> {
+    data.chunks(channel_count)
+        .filter_map(|frame| frame.get(target_channel).copied())
+        .collect()
 }
 
 fn render_i16_output(
@@ -296,5 +455,11 @@ mod tests {
         render_u16_output(&mut buffer, 1, 0, &mut generator);
 
         assert!(buffer.iter().any(|sample| *sample != u16::MAX / 2));
+    }
+
+    #[test]
+    fn extracts_requested_input_channel() {
+        let selected = extract_f32_channel(&[0.1, 0.2, 0.3, 0.4], 2, 1);
+        assert_eq!(selected, vec![0.2, 0.4]);
     }
 }
