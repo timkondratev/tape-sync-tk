@@ -5,11 +5,10 @@ use crate::ltc::{
 };
 use crate::midi::{self, MidiOutputPort, MidiTransport};
 use crate::startup::{StartupReport, SystemInventory, preflight};
-use crate::sync_core::{DecodeSyncBridge, SyncEngine};
+use crate::sync_core::{SchedulerRuntime, SchedulerStatus, spawn_scheduled_decode_sync_handler};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Stream};
 use std::fmt;
-use std::sync::{Arc, Mutex};
 
 const RETRY_HINT: &str = "Fix the device or channel configuration, then try again.";
 
@@ -19,6 +18,7 @@ pub struct StartupRuntime<A = Device, S = Stream, M = MidiOutputPort> {
     pub midi_port_name: String,
     pub report: StartupReport,
     _midi: Option<M>,
+    scheduler: Option<SchedulerRuntime>,
 }
 
 impl<A, S, M> StartupRuntime<A, S, M> {
@@ -30,6 +30,10 @@ impl<A, S, M> StartupRuntime<A, S, M> {
                 .and_then(|status| status.lock().ok().map(|status| status.clone())),
             AudioRuntime::Generate { .. } => None,
         }
+    }
+
+    pub fn scheduler_status_snapshot(&self) -> Option<SchedulerStatus> {
+        self.scheduler.as_ref().map(SchedulerRuntime::status)
     }
 }
 
@@ -52,7 +56,7 @@ where
     let midi_port_name = config.midi.port_name.clone();
     let midi = backend.create_virtual_midi_output(&midi_port_name)?;
 
-    let (audio, midi) = match config.mode {
+    let (audio, midi, scheduler) = match config.mode {
         Mode::Generate => (
             AudioRuntime::Generate {
                 output: backend.open_output(
@@ -68,16 +72,22 @@ where
                 )?,
             },
             Some(midi),
+            None,
         ),
         Mode::Decode => {
-            let decode_status_handler = Some(make_decode_status_handler(
+            let (decode_status_handler, scheduler) = spawn_scheduled_decode_sync_handler(
                 midi,
                 config.tempo.ref_bpm,
-                config.timecode.ltc_fps,
+                Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
                 config.total_latency_ms(),
                 config.midi.send_clock,
                 config.midi.send_transport,
-            ));
+            )?;
             (
                 AudioRuntime::Decode {
                     input: backend.open_input(
@@ -94,10 +104,11 @@ where
                             fps_estimate_window_size: config.decode.fps_estimate_window_frames,
                             dropout_reset_windows: config.decode.dropout_reset_windows,
                         },
-                        decode_status_handler,
+                        Some(decode_status_handler),
                     )?,
                 },
                 None,
+                Some(scheduler),
             )
         }
     };
@@ -107,34 +118,8 @@ where
         midi_port_name,
         report,
         _midi: midi,
+        scheduler,
     })
-}
-
-fn make_decode_status_handler<M>(
-    midi: M,
-    ref_bpm: f64,
-    ltc_fps: crate::config::Fps,
-    latency_ms: f64,
-    send_clock: bool,
-    send_transport: bool,
-) -> SharedDecodeStatusHandler
-where
-    M: MidiTransport + Send + 'static,
-{
-    let engine = SyncEngine::new(midi, send_clock, send_transport);
-    let bridge = DecodeSyncBridge::new(
-        engine,
-        ref_bpm,
-        ltc_fps,
-        Timecode {
-            hours: 1,
-            minutes: 0,
-            seconds: 0,
-            frames: 0,
-        },
-        latency_ms,
-    );
-    Arc::new(Mutex::new(Box::new(bridge)))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -460,7 +445,7 @@ send_transport = true
         let runtime = initialize_with(&config("generate"), &inventory(), &FakeBackend::default())
             .expect("runtime should initialize");
 
-        match runtime.audio {
+        match &runtime.audio {
             AudioRuntime::Generate { output } => {
                 assert_eq!(output.device, "Output A");
                 assert_eq!(output.sample_rate, 44100);
@@ -470,6 +455,7 @@ send_transport = true
         }
 
         assert_eq!(runtime.midi_port_name, "TapeSync MIDI Out");
+        assert!(runtime.scheduler_status_snapshot().is_none());
     }
 
     #[test]
@@ -562,5 +548,6 @@ send_transport = true
         assert!(snapshot.measured_fps.is_some());
         assert!(snapshot.smoothed_tempo_bpm.is_some());
         assert!(matches!(snapshot.direction, PlaybackDirection::Forward));
+        assert!(runtime.scheduler_status_snapshot().is_some());
     }
 }

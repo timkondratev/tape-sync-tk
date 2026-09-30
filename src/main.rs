@@ -110,6 +110,16 @@ fn run_mode<W: Write>(
             if let Some(status) = &status {
                 writeln!(output, "{}\r", render_status_line(status))?;
             }
+            if let Some(scheduler) = runtime.scheduler_status_snapshot() {
+                writeln!(
+                    output,
+                    "scheduler running={} dropped={} late={} error={}\r",
+                    scheduler.running,
+                    scheduler.dropped_update_count,
+                    scheduler.late_tick_count,
+                    scheduler.last_error.as_deref().unwrap_or("-")
+                )?;
+            }
             writeln!(output, "\rEsc/b: back to menu    q/Ctrl-C: quit\r")?;
             output.flush()?;
             last_status = status;

@@ -353,6 +353,14 @@ Hardware pass criteria:
 
 ## 8. Rollout Plan
 
+### Implementation status (2026-09-30)
+
+- **Phase 0 - In progress:** deterministic clock timeline tests now measure tick count, interval error, rolling BPM, phase error, and late-iteration burst prevention at 126 BPM/30 fps. Missing-frame and callback-size regressions exist. A timestamped end-to-end MIDI sink, real returned-LTC capture, and full impairment harness remain.
+- **Phase 1 - In progress:** speed estimation now uses LTC ordinal gaps over aggregate sample intervals, tempo derives from the aggregate estimate, day wrap is covered, and dropout reset uses sample time rather than callback count. A time-based robust regression estimator, explicit confidence, broader continuity rejection, and the long drift/loss matrix remain.
+- **Phase 2 - In progress:** Decode mode now uses a dedicated monotonic MIDI scheduler, preserves phase across tempo updates, spaces clocks independently of LTC callbacks, and drops overdue ticks instead of bursting. Explicit holdover state, bounded reacquisition correction, discontinuity policy, and backend-timestamp support remain.
+- **Phase 3 - In progress:** MIDI I/O has moved off the audio callback through a bounded non-blocking handoff. The scheduler worker is runtime-owned and joined on shutdown; dropped updates, late ticks, disconnects, and MIDI errors are observable. A preallocated audio queue, decode worker, allocation removal, and callback contract instrumentation remain.
+- **Phases 4-6 - Not started:** opt-in hardware comparison, default-on release, fallback period, and legacy removal remain.
+
 ### Phase 0: Capture and reproduce
 
 - Add timestamped MIDI sink, virtual-time source, and metrics without changing production behavior.
