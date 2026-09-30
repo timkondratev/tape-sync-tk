@@ -113,8 +113,11 @@ fn run_mode<W: Write>(
             if let Some(scheduler) = runtime.scheduler_status_snapshot() {
                 writeln!(
                     output,
-                    "scheduler running={} dropped={} late={} error={}\r",
+                    "scheduler running={} holdover={} phase_us={} jumps={} dropped={} late={} error={}\r",
                     scheduler.running,
+                    scheduler.holdover_active,
+                    scheduler.phase_error_micros,
+                    scheduler.discontinuity_count,
                     scheduler.dropped_update_count,
                     scheduler.late_tick_count,
                     scheduler.last_error.as_deref().unwrap_or("-")

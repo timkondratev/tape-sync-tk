@@ -7,13 +7,15 @@ use crate::runtime::RuntimeError;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const INACTIVE_SCHEDULER_POLL: Duration = Duration::from_millis(100);
 const LATE_TICK_THRESHOLD: Duration = Duration::from_millis(2);
+const CLOCK_HOLDOVER: Duration = Duration::from_millis(500);
+const PHASE_CORRECTION_HORIZON: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncUpdate {
@@ -98,6 +100,142 @@ struct SchedulerUpdate {
     sync: SyncUpdate,
     tempo_bpm: f64,
     phase_on_lock: f64,
+    decoded_frame_count: u64,
+    source_clock_position: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PhaseDecision {
+    Initialize,
+    Slew {
+        error_seconds: f64,
+        correction_seconds: f64,
+    },
+    Discontinuity {
+        error_seconds: f64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PhaseObservation {
+    at: Instant,
+    tracked_clock_position: f64,
+    clocks_per_second: f64,
+}
+
+#[derive(Debug, Default)]
+struct SourcePhaseTracker {
+    previous: Option<PhaseObservation>,
+}
+
+impl SourcePhaseTracker {
+    fn observe(
+        &mut self,
+        now: Instant,
+        source_clock_position: f64,
+        tempo_bpm: f64,
+    ) -> PhaseDecision {
+        let clocks_per_second = tempo_bpm * 24.0 / 60.0;
+        if !source_clock_position.is_finite()
+            || !clocks_per_second.is_finite()
+            || clocks_per_second <= 0.0
+        {
+            return PhaseDecision::Initialize;
+        }
+
+        let Some(previous) = self.previous else {
+            self.previous = Some(PhaseObservation {
+                at: now,
+                tracked_clock_position: source_clock_position,
+                clocks_per_second,
+            });
+            return PhaseDecision::Initialize;
+        };
+
+        let elapsed = now.saturating_duration_since(previous.at);
+        let predicted_clock_position =
+            previous.tracked_clock_position + elapsed.as_secs_f64() * previous.clocks_per_second;
+        let error_clocks = source_clock_position - predicted_clock_position;
+        let error_seconds = error_clocks / clocks_per_second;
+        let discontinuity_threshold = (60.0 / tempo_bpm).min(0.5);
+
+        if error_seconds.abs() >= discontinuity_threshold {
+            self.previous = Some(PhaseObservation {
+                at: now,
+                tracked_clock_position: source_clock_position,
+                clocks_per_second,
+            });
+            return PhaseDecision::Discontinuity { error_seconds };
+        }
+
+        let correction_fraction =
+            (elapsed.as_secs_f64() / PHASE_CORRECTION_HORIZON.as_secs_f64()).clamp(0.0, 1.0);
+        let correction_clocks = error_clocks * correction_fraction;
+        self.previous = Some(PhaseObservation {
+            at: now,
+            tracked_clock_position: predicted_clock_position + correction_clocks,
+            clocks_per_second,
+        });
+        PhaseDecision::Slew {
+            error_seconds,
+            correction_seconds: correction_clocks / clocks_per_second,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SchedulerHoldover {
+    last_decoded_frame_count: u64,
+    last_frame_at: Option<Instant>,
+    pending_unlock: Option<SyncUpdate>,
+}
+
+impl SchedulerHoldover {
+    fn observe(
+        &mut self,
+        update: SchedulerUpdate,
+        now: Instant,
+        currently_locked: bool,
+    ) -> Option<SyncUpdate> {
+        if update.decoded_frame_count > self.last_decoded_frame_count {
+            self.last_decoded_frame_count = update.decoded_frame_count;
+            self.last_frame_at = Some(now);
+        }
+
+        let within_holdover = self
+            .last_frame_at
+            .is_some_and(|last_frame| now.saturating_duration_since(last_frame) < CLOCK_HOLDOVER);
+        if currently_locked
+            && update.sync.lock_status == LockStatus::Unlocked
+            && update.sync.direction == PlaybackDirection::Forward
+            && within_holdover
+        {
+            self.pending_unlock = Some(update.sync);
+            return None;
+        }
+
+        self.pending_unlock = None;
+        Some(update.sync)
+    }
+
+    fn take_expired(&mut self, now: Instant) -> Option<SyncUpdate> {
+        let deadline = self.last_frame_at? + CLOCK_HOLDOVER;
+        if now < deadline {
+            return None;
+        }
+        self.pending_unlock.take()
+    }
+
+    fn wait_duration(&self, now: Instant) -> Option<Duration> {
+        self.pending_unlock.and_then(|_| {
+            self.last_frame_at
+                .map(|last_frame| (last_frame + CLOCK_HOLDOVER).saturating_duration_since(now))
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        self.pending_unlock.is_some()
+    }
 }
 
 #[derive(Debug)]
@@ -153,27 +291,59 @@ impl ClockTimeline {
         self.next_tick
             .map(|deadline| deadline.saturating_duration_since(now))
     }
+
+    fn slew_phase(&mut self, now: Instant, correction_seconds: f64) {
+        let Some(next_tick) = self.next_tick else {
+            return;
+        };
+        let maximum_shift = self.period.as_secs_f64() / 2.0;
+        let shift = (-correction_seconds).clamp(-maximum_shift, maximum_shift);
+        self.next_tick = Some(if shift < 0.0 {
+            next_tick
+                .checked_sub(Duration::from_secs_f64(-shift))
+                .unwrap_or(now)
+                .max(now)
+        } else {
+            next_tick + Duration::from_secs_f64(shift)
+        });
+    }
 }
 
 struct ScheduledDecodeSyncBridge {
     sender: SyncSender<SchedulerUpdate>,
     health: Arc<SchedulerHealth>,
     ref_bpm: f64,
+    ltc_fps: Fps,
     anchor_timecode: Timecode,
     latency_ms: f64,
+    last_sent_frame_count: u64,
 }
 
 impl DecodeStatusHandler for ScheduledDecodeSyncBridge {
     fn handle_status(&mut self, status: &DecodeStatus) {
-        let measured_fps = status.measured_fps.unwrap_or(0.0);
         let tempo_bpm = status.smoothed_tempo_bpm.unwrap_or(self.ref_bpm);
+        let has_new_frame = status.decoded_frame_count > self.last_sent_frame_count;
+        self.last_sent_frame_count = status.decoded_frame_count;
+        let source_clock_position = if has_new_frame {
+            status.current_timecode.map(|timecode| {
+                musical_clock_position(
+                    timecode,
+                    self.anchor_timecode,
+                    self.ltc_fps.as_f64(),
+                    self.ref_bpm,
+                    self.latency_ms,
+                )
+            })
+        } else {
+            None
+        };
         let song_position_pointer = status
             .current_timecode
             .map(|timecode| {
                 song_position_pointer(
                     timecode,
                     self.anchor_timecode,
-                    measured_fps,
+                    self.ltc_fps.as_f64(),
                     self.ref_bpm,
                     self.latency_ms,
                 )
@@ -187,7 +357,11 @@ impl DecodeStatusHandler for ScheduledDecodeSyncBridge {
                 emit_clock_tick: false,
             },
             tempo_bpm,
-            phase_on_lock: latency_phase(self.latency_ms, tempo_bpm),
+            phase_on_lock: source_clock_position
+                .map(|position| position.rem_euclid(1.0))
+                .unwrap_or_else(|| latency_phase(self.latency_ms, tempo_bpm)),
+            decoded_frame_count: status.decoded_frame_count,
+            source_clock_position,
         };
 
         match self.sender.try_send(update) {
@@ -208,8 +382,11 @@ impl DecodeStatusHandler for ScheduledDecodeSyncBridge {
 pub struct SchedulerStatus {
     pub running: bool,
     pub disconnected: bool,
+    pub holdover_active: bool,
     pub dropped_update_count: u64,
     pub late_tick_count: u64,
+    pub phase_error_micros: i64,
+    pub discontinuity_count: u64,
     pub last_error: Option<String>,
 }
 
@@ -217,8 +394,11 @@ pub struct SchedulerStatus {
 struct SchedulerHealth {
     running: AtomicBool,
     disconnected: AtomicBool,
+    holdover_active: AtomicBool,
     dropped_update_count: AtomicU64,
     late_tick_count: AtomicU64,
+    phase_error_micros: AtomicI64,
+    discontinuity_count: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -227,8 +407,11 @@ impl SchedulerHealth {
         SchedulerStatus {
             running: self.running.load(Ordering::Relaxed),
             disconnected: self.disconnected.load(Ordering::Relaxed),
+            holdover_active: self.holdover_active.load(Ordering::Relaxed),
             dropped_update_count: self.dropped_update_count.load(Ordering::Relaxed),
             late_tick_count: self.late_tick_count.load(Ordering::Relaxed),
+            phase_error_micros: self.phase_error_micros.load(Ordering::Relaxed),
+            discontinuity_count: self.discontinuity_count.load(Ordering::Relaxed),
             last_error: self.last_error.lock().ok().and_then(|error| error.clone()),
         }
     }
@@ -265,6 +448,7 @@ impl Drop for SchedulerRuntime {
 pub fn spawn_scheduled_decode_sync_handler<P>(
     midi: P,
     ref_bpm: f64,
+    ltc_fps: Fps,
     anchor_timecode: Timecode,
     latency_ms: f64,
     send_clock: bool,
@@ -297,8 +481,10 @@ where
         sender,
         health: Arc::clone(&health),
         ref_bpm,
+        ltc_fps,
         anchor_timecode,
         latency_ms,
+        last_sent_frame_count: 0,
     }) as Box<dyn DecodeStatusHandler>));
     let runtime = SchedulerRuntime {
         shutdown,
@@ -315,6 +501,8 @@ fn run_scheduler<P: MidiTransport>(
     health: Arc<SchedulerHealth>,
 ) {
     let mut timeline = ClockTimeline::default();
+    let mut holdover = SchedulerHoldover::default();
+    let mut phase_tracker = SourcePhaseTracker::default();
     let mut current_update = SyncUpdate {
         lock_status: LockStatus::Unlocked,
         direction: PlaybackDirection::Forward,
@@ -324,6 +512,15 @@ fn run_scheduler<P: MidiTransport>(
 
     while !shutdown.load(Ordering::Relaxed) {
         let now = Instant::now();
+        if let Some(expired_unlock) = holdover.take_expired(now) {
+            current_update = expired_unlock;
+            health.holdover_active.store(false, Ordering::Relaxed);
+            if let Err(error) = engine.apply_update(current_update) {
+                health.record_error(error);
+                break;
+            }
+            timeline.update(now, false, 0.0, 0.0);
+        }
         if let Some(deadline) = timeline.take_due(now) {
             if now.saturating_duration_since(deadline) > LATE_TICK_THRESHOLD {
                 health.late_tick_count.fetch_add(1, Ordering::Relaxed);
@@ -337,7 +534,16 @@ fn run_scheduler<P: MidiTransport>(
             }
         }
 
-        let received = match timeline.wait_duration(Instant::now()) {
+        let now = Instant::now();
+        let clock_wait = timeline.wait_duration(now);
+        let holdover_wait = holdover.wait_duration(now);
+        let wait = match (clock_wait, holdover_wait) {
+            (Some(clock), Some(holdover)) => Some(clock.min(holdover)),
+            (Some(clock), None) => Some(clock),
+            (None, Some(holdover)) => Some(holdover),
+            (None, None) => None,
+        };
+        let received = match wait {
             Some(wait) => receiver.recv_timeout(wait).map_err(|error| match error {
                 std::sync::mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
                 std::sync::mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
@@ -352,19 +558,65 @@ fn run_scheduler<P: MidiTransport>(
 
         match received {
             Ok(update) => {
-                current_update = update.sync;
+                let now = Instant::now();
+                let Some(sync_update) = holdover.observe(
+                    update,
+                    now,
+                    current_update.lock_status == LockStatus::Locked,
+                ) else {
+                    health.holdover_active.store(true, Ordering::Relaxed);
+                    continue;
+                };
+                health
+                    .holdover_active
+                    .store(holdover.is_active(), Ordering::Relaxed);
+                let phase_decision = update
+                    .source_clock_position
+                    .map(|position| phase_tracker.observe(now, position, update.tempo_bpm));
+                let was_locked = current_update.lock_status == LockStatus::Locked;
+                if let Some(PhaseDecision::Discontinuity { error_seconds }) = phase_decision {
+                    health.phase_error_micros.store(
+                        (error_seconds * 1_000_000.0).round() as i64,
+                        Ordering::Relaxed,
+                    );
+                    if was_locked && sync_update.lock_status == LockStatus::Locked {
+                        let stop = SyncUpdate {
+                            lock_status: LockStatus::Unlocked,
+                            emit_clock_tick: false,
+                            ..sync_update
+                        };
+                        if let Err(error) = engine.apply_update(stop) {
+                            health.record_error(error);
+                            break;
+                        }
+                        timeline.update(now, false, 0.0, 0.0);
+                        health.discontinuity_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                current_update = sync_update;
                 if let Err(error) = engine.apply_update(current_update) {
                     health.record_error(error);
                     break;
                 }
                 let active = current_update.lock_status == LockStatus::Locked
                     && current_update.direction == PlaybackDirection::Forward;
-                timeline.update(
-                    Instant::now(),
-                    active,
-                    update.tempo_bpm,
-                    update.phase_on_lock,
-                );
+                timeline.update(now, active, update.tempo_bpm, update.phase_on_lock);
+                match phase_decision {
+                    Some(PhaseDecision::Slew {
+                        error_seconds,
+                        correction_seconds,
+                    }) => {
+                        health.phase_error_micros.store(
+                            (error_seconds * 1_000_000.0).round() as i64,
+                            Ordering::Relaxed,
+                        );
+                        timeline.slew_phase(now, correction_seconds);
+                    }
+                    Some(PhaseDecision::Initialize) => {
+                        health.phase_error_micros.store(0, Ordering::Relaxed);
+                    }
+                    Some(PhaseDecision::Discontinuity { .. }) | None => {}
+                }
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => break,
@@ -487,16 +739,23 @@ fn song_position_pointer(
     ref_bpm: f64,
     latency_ms: f64,
 ) -> u16 {
-    let fps = if measured_fps > 0.0 {
-        measured_fps
-    } else {
-        30.0
-    };
+    let clock_position =
+        musical_clock_position(timecode, anchor_timecode, measured_fps, ref_bpm, latency_ms);
+    let spp = (clock_position / 6.0).floor();
+    spp.clamp(0.0, 0x3FFF as f64) as u16
+}
+
+fn musical_clock_position(
+    timecode: Timecode,
+    anchor_timecode: Timecode,
+    ltc_fps: f64,
+    ref_bpm: f64,
+    latency_ms: f64,
+) -> f64 {
+    let fps = if ltc_fps > 0.0 { ltc_fps } else { 30.0 };
     let seconds = timecode_seconds(timecode, fps) + latency_ms / 1000.0
         - timecode_seconds(anchor_timecode, fps);
-    let beats = seconds.max(0.0) * ref_bpm / 60.0;
-    let spp = (beats * 4.0).floor();
-    spp.clamp(0.0, 0x3FFF as f64) as u16
+    seconds.max(0.0) * ref_bpm * 24.0 / 60.0
 }
 
 fn latency_phase(latency_ms: f64, tempo_bpm: f64) -> f64 {
@@ -549,6 +808,54 @@ mod tests {
     struct SchedulerTestTransport {
         dropped: Arc<AtomicBool>,
         fail_transport: bool,
+    }
+
+    #[derive(Clone)]
+    struct RecordingTransport {
+        messages: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl MidiTransport for RecordingTransport {
+        fn send_start(&mut self) -> Result<(), RuntimeError> {
+            self.messages
+                .lock()
+                .expect("messages lock")
+                .push(vec![0xFA]);
+            Ok(())
+        }
+
+        fn send_stop(&mut self) -> Result<(), RuntimeError> {
+            self.messages
+                .lock()
+                .expect("messages lock")
+                .push(vec![0xFC]);
+            Ok(())
+        }
+
+        fn send_continue(&mut self) -> Result<(), RuntimeError> {
+            self.messages
+                .lock()
+                .expect("messages lock")
+                .push(vec![0xFB]);
+            Ok(())
+        }
+
+        fn send_clock(&mut self) -> Result<(), RuntimeError> {
+            self.messages
+                .lock()
+                .expect("messages lock")
+                .push(vec![0xF8]);
+            Ok(())
+        }
+
+        fn send_song_position_pointer(&mut self, position: u16) -> Result<(), RuntimeError> {
+            self.messages.lock().expect("messages lock").push(vec![
+                0xF2,
+                (position & 0x7F) as u8,
+                ((position >> 7) & 0x7F) as u8,
+            ]);
+            Ok(())
+        }
     }
 
     impl Drop for SchedulerTestTransport {
@@ -751,6 +1058,158 @@ mod tests {
     }
 
     #[test]
+    fn phase_tracker_has_no_error_at_steady_speed() {
+        let start = Instant::now();
+        let mut tracker = SourcePhaseTracker::default();
+        assert!(matches!(
+            tracker.observe(start, 0.0, 120.0),
+            PhaseDecision::Initialize
+        ));
+
+        let decision = tracker.observe(start + Duration::from_secs(1), 48.0, 120.0);
+        assert!(matches!(
+            decision,
+            PhaseDecision::Slew {
+                error_seconds,
+                correction_seconds,
+            } if error_seconds.abs() < 1e-12 && correction_seconds.abs() < 1e-12
+        ));
+    }
+
+    #[test]
+    fn small_phase_error_converges_over_multiple_observations() {
+        let start = Instant::now();
+        let mut tracker = SourcePhaseTracker::default();
+        let _ = tracker.observe(start, 0.0, 120.0);
+
+        let first_error = match tracker.observe(start + Duration::from_secs(1), 48.24, 120.0) {
+            PhaseDecision::Slew { error_seconds, .. } => error_seconds,
+            other => panic!("expected slew, got {other:?}"),
+        };
+        let second_error = match tracker.observe(start + Duration::from_secs(2), 96.24, 120.0) {
+            PhaseDecision::Slew { error_seconds, .. } => error_seconds,
+            other => panic!("expected slew, got {other:?}"),
+        };
+
+        assert!(second_error.abs() < first_error.abs());
+        assert!(first_error.abs() < 0.01);
+    }
+
+    #[test]
+    fn quarter_note_phase_jump_is_a_discontinuity() {
+        let start = Instant::now();
+        let mut tracker = SourcePhaseTracker::default();
+        let _ = tracker.observe(start, 0.0, 120.0);
+
+        let decision = tracker.observe(start + Duration::from_secs(1), 72.0, 120.0);
+        assert!(matches!(
+            decision,
+            PhaseDecision::Discontinuity { error_seconds }
+                if (error_seconds - 0.5).abs() < 1e-12
+        ));
+    }
+
+    #[test]
+    fn phase_slew_is_bounded_to_half_a_clock_period() {
+        let start = Instant::now();
+        let mut timeline = ClockTimeline::default();
+        timeline.update(start, true, 120.0, 0.0);
+        let before = timeline.next_tick.expect("next tick should exist");
+
+        timeline.slew_phase(start, 1.0);
+
+        let after = timeline.next_tick.expect("next tick should remain");
+        let maximum_shift = timeline.period.div_f64(2.0);
+        assert!(before.saturating_duration_since(after) <= maximum_shift);
+    }
+
+    #[test]
+    fn song_position_uses_nominal_ltc_rate() {
+        let anchor = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
+        let one_second_later = Timecode {
+            seconds: 1,
+            ..anchor
+        };
+
+        assert_eq!(
+            song_position_pointer(one_second_later, anchor, 30.0, 120.0, 0.0),
+            8
+        );
+    }
+
+    fn scheduler_update(lock_status: LockStatus, decoded_frame_count: u64) -> SchedulerUpdate {
+        SchedulerUpdate {
+            sync: SyncUpdate {
+                lock_status,
+                direction: PlaybackDirection::Forward,
+                song_position_pointer: 0,
+                emit_clock_tick: false,
+            },
+            tempo_bpm: 120.0,
+            phase_on_lock: 0.0,
+            decoded_frame_count,
+            source_clock_position: None,
+        }
+    }
+
+    #[test]
+    fn short_decode_loss_holds_clock_and_reacquires_without_unlock() {
+        let start = Instant::now();
+        let mut holdover = SchedulerHoldover::default();
+        let locked = scheduler_update(LockStatus::Locked, 10);
+        assert_eq!(holdover.observe(locked, start, false), Some(locked.sync));
+
+        let unlocked = scheduler_update(LockStatus::Unlocked, 10);
+        assert_eq!(
+            holdover.observe(unlocked, start + Duration::from_millis(150), true),
+            None
+        );
+        assert!(holdover.is_active());
+        assert_eq!(
+            holdover.take_expired(start + Duration::from_millis(499)),
+            None
+        );
+
+        let reacquired = scheduler_update(LockStatus::Locked, 11);
+        assert_eq!(
+            holdover.observe(reacquired, start + Duration::from_millis(250), true),
+            Some(reacquired.sync)
+        );
+        assert!(!holdover.is_active());
+        assert_eq!(
+            holdover.take_expired(start + Duration::from_millis(600)),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_loss_expires_once_after_500_ms() {
+        let start = Instant::now();
+        let mut holdover = SchedulerHoldover::default();
+        let locked = scheduler_update(LockStatus::Locked, 10);
+        let _ = holdover.observe(locked, start, false);
+        let unlocked = scheduler_update(LockStatus::Unlocked, 10);
+        assert_eq!(
+            holdover.observe(unlocked, start + Duration::from_millis(150), true),
+            None
+        );
+
+        assert_eq!(
+            holdover.take_expired(start + Duration::from_millis(500)),
+            Some(unlocked.sync)
+        );
+        assert_eq!(
+            holdover.take_expired(start + Duration::from_millis(750)),
+            None
+        );
+    }
+
+    #[test]
     fn scheduler_runtime_joins_and_drops_midi_transport() {
         let dropped = Arc::new(AtomicBool::new(false));
         let (handler, runtime) = spawn_scheduled_decode_sync_handler(
@@ -759,6 +1218,7 @@ mod tests {
                 fail_transport: false,
             },
             120.0,
+            Fps::Fps30,
             Timecode {
                 hours: 1,
                 minutes: 0,
@@ -784,6 +1244,7 @@ mod tests {
                 fail_transport: true,
             },
             120.0,
+            Fps::Fps30,
             Timecode {
                 hours: 1,
                 minutes: 0,
@@ -826,6 +1287,71 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("scheduler test failure"))
         );
+    }
+
+    #[test]
+    fn large_phase_jump_stops_repositions_and_continues_without_clock_burst() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let anchor = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
+        let (handler, runtime) = spawn_scheduled_decode_sync_handler(
+            RecordingTransport {
+                messages: Arc::clone(&messages),
+            },
+            120.0,
+            Fps::Fps30,
+            anchor,
+            0.0,
+            true,
+            true,
+        )
+        .expect("scheduler should start");
+
+        let send_status = |timecode, decoded_frame_count| {
+            handler
+                .lock()
+                .expect("handler lock")
+                .handle_status(&DecodeStatus {
+                    lock_status: LockStatus::Locked,
+                    direction: PlaybackDirection::Forward,
+                    current_timecode: Some(timecode),
+                    decoded_frame_count,
+                    measured_fps: Some(30.0),
+                    smoothed_tempo_bpm: Some(120.0),
+                    ..DecodeStatus::default()
+                });
+        };
+        send_status(anchor, 1);
+        let first_timeout = Instant::now() + Duration::from_secs(1);
+        while messages.lock().expect("messages lock").len() < 2 && Instant::now() < first_timeout {
+            thread::yield_now();
+        }
+
+        send_status(
+            Timecode {
+                seconds: 1,
+                ..anchor
+            },
+            2,
+        );
+        let second_timeout = Instant::now() + Duration::from_secs(1);
+        while runtime.status().discontinuity_count == 0 && Instant::now() < second_timeout {
+            thread::yield_now();
+        }
+
+        let recorded = messages.lock().expect("messages lock").clone();
+        let reposition = recorded
+            .windows(3)
+            .find(|messages| messages[0] == [0xFC] && messages[1][0] == 0xF2);
+        assert_eq!(
+            reposition,
+            Some(&[vec![0xFC], vec![0xF2, 0x08, 0x00], vec![0xFB]][..])
+        );
+        assert_eq!(runtime.status().discontinuity_count, 1);
     }
 
     #[test]

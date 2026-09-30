@@ -78,6 +78,7 @@ where
             let (decode_status_handler, scheduler) = spawn_scheduled_decode_sync_handler(
                 midi,
                 config.tempo.ref_bpm,
+                config.timecode.ltc_fps,
                 Timecode {
                     hours: 1,
                     minutes: 0,
