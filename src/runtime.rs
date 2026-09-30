@@ -1,14 +1,18 @@
 use crate::audio::{self, AudioEndpoint, AudioRuntime, DecodeWorkerStatus};
-use crate::config::{AppConfig, Mode};
+use crate::config::{AppConfig, Mode, TimingEngine};
 use crate::ltc::{
     DecodeRequest, DecodeStatus, GeneratorRequest, SharedDecodeStatusHandler, Timecode,
 };
 use crate::midi::{self, MidiOutputPort, MidiTransport};
 use crate::startup::{StartupReport, SystemInventory, preflight};
-use crate::sync_core::{SchedulerRuntime, SchedulerStatus, spawn_scheduled_decode_sync_handler};
+use crate::sync_core::{
+    DecodeSyncBridge, SchedulerRuntime, SchedulerStatus, SyncEngine,
+    spawn_scheduled_decode_sync_handler,
+};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Stream};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 const RETRY_HINT: &str = "Fix the device or channel configuration, then try again.";
 
@@ -84,20 +88,38 @@ where
             None,
         ),
         Mode::Decode => {
-            let (decode_status_handler, scheduler) = spawn_scheduled_decode_sync_handler(
-                midi,
-                config.tempo.ref_bpm,
-                config.timecode.ltc_fps,
-                Timecode {
-                    hours: 1,
-                    minutes: 0,
-                    seconds: 0,
-                    frames: 0,
-                },
-                config.total_latency_ms(),
-                config.midi.send_clock,
-                config.midi.send_transport,
-            )?;
+            let anchor_timecode = Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            };
+            let (decode_status_handler, scheduler) = match config.decode.timing_engine {
+                TimingEngine::Hardened => {
+                    let (handler, scheduler) = spawn_scheduled_decode_sync_handler(
+                        midi,
+                        config.tempo.ref_bpm,
+                        config.timecode.ltc_fps,
+                        anchor_timecode,
+                        config.total_latency_ms(),
+                        config.midi.send_clock,
+                        config.midi.send_transport,
+                    )?;
+                    (handler, Some(scheduler))
+                }
+                TimingEngine::LegacyFrameClock => (
+                    make_legacy_decode_status_handler(
+                        midi,
+                        config.tempo.ref_bpm,
+                        config.timecode.ltc_fps,
+                        anchor_timecode,
+                        config.total_latency_ms(),
+                        config.midi.send_clock,
+                        config.midi.send_transport,
+                    ),
+                    None,
+                ),
+            };
             (
                 AudioRuntime::Decode {
                     input: backend.open_input(
@@ -118,7 +140,7 @@ where
                     )?,
                 },
                 None,
-                Some(scheduler),
+                scheduler,
             )
         }
     };
@@ -130,6 +152,28 @@ where
         _midi: midi,
         scheduler,
     })
+}
+
+fn make_legacy_decode_status_handler<M>(
+    midi: M,
+    ref_bpm: f64,
+    ltc_fps: crate::config::Fps,
+    anchor_timecode: Timecode,
+    latency_ms: f64,
+    send_clock: bool,
+    send_transport: bool,
+) -> SharedDecodeStatusHandler
+where
+    M: MidiTransport + Send + 'static,
+{
+    let engine = SyncEngine::new(midi, send_clock, send_transport);
+    Arc::new(Mutex::new(Box::new(DecodeSyncBridge::new(
+        engine,
+        ref_bpm,
+        ltc_fps,
+        anchor_timecode,
+        latency_ms,
+    ))))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -563,5 +607,16 @@ send_transport = true
         assert!(matches!(snapshot.direction, PlaybackDirection::Forward));
         assert!(runtime.scheduler_status_snapshot().is_some());
         assert!(runtime.decode_worker_status_snapshot().is_none());
+    }
+
+    #[test]
+    fn legacy_timing_engine_does_not_start_scheduler_worker() {
+        let mut config = config("decode");
+        config.decode.timing_engine = TimingEngine::LegacyFrameClock;
+
+        let runtime = initialize_with(&config, &inventory(), &FakeBackend::default())
+            .expect("legacy decode runtime should initialize");
+
+        assert!(runtime.scheduler_status_snapshot().is_none());
     }
 }

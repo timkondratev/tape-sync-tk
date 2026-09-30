@@ -99,6 +99,13 @@ fn run_mode<W: Write>(
             execute!(output, Clear(ClearType::All), MoveTo(0, 0))?;
             writeln!(output, "Running {:?}\r", config.mode)?;
             writeln!(output, "{mode_summary}\r")?;
+            if matches!(config.mode, tape_sync_tk::config::Mode::Decode) {
+                writeln!(
+                    output,
+                    "Timing engine: {}\r",
+                    config.decode.timing_engine.as_str()
+                )?;
+            }
             writeln!(
                 output,
                 "Total latency: {:.2} ms\r",

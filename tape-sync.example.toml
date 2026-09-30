@@ -15,6 +15,7 @@ ref_fps = 30.0
 smoothing_alpha = 0.15
 
 [decode]
+timing_engine = "hardened"
 fps_estimate_window_frames = 12
 dropout_reset_windows = 8
 

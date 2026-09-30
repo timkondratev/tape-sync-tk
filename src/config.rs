@@ -297,13 +297,38 @@ pub struct TempoConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DecodeConfig {
+    #[serde(default)]
+    pub timing_engine: TimingEngine,
     pub fps_estimate_window_frames: usize,
     pub dropout_reset_windows: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingEngine {
+    Hardened,
+    LegacyFrameClock,
+}
+
+impl Default for TimingEngine {
+    fn default() -> Self {
+        Self::Hardened
+    }
+}
+
+impl TimingEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hardened => "hardened",
+            Self::LegacyFrameClock => "legacy_frame_clock",
+        }
+    }
 }
 
 impl Default for DecodeConfig {
     fn default() -> Self {
         Self {
+            timing_engine: TimingEngine::Hardened,
             fps_estimate_window_frames: 12,
             dropout_reset_windows: 8,
         }
@@ -378,6 +403,7 @@ ref_fps = 30.0
 smoothing_alpha = 0.15
 
 [decode]
+timing_engine = "hardened"
 fps_estimate_window_frames = 12
 dropout_reset_windows = 8
 
@@ -401,6 +427,26 @@ send_transport = true
         assert_eq!(config.timecode.ltc_fps.as_f64(), 30.0);
         assert_eq!(config.tempo.ref_fps.as_f64(), 30.0);
         assert!((config.total_latency_ms() - 35.0).abs() < f64::EPSILON);
+        assert_eq!(config.decode.timing_engine, TimingEngine::Hardened);
+    }
+
+    #[test]
+    fn decode_timing_engine_defaults_to_hardened_when_omitted() {
+        let raw = valid_config().replace("timing_engine = \"hardened\"\n", "");
+        let config = AppConfig::from_toml_str(&raw).expect("legacy config should parse");
+
+        assert_eq!(config.decode.timing_engine, TimingEngine::Hardened);
+    }
+
+    #[test]
+    fn accepts_legacy_frame_clock_timing_engine() {
+        let raw = valid_config().replace(
+            "timing_engine = \"hardened\"",
+            "timing_engine = \"legacy_frame_clock\"",
+        );
+        let config = AppConfig::from_toml_str(&raw).expect("legacy engine should parse");
+
+        assert_eq!(config.decode.timing_engine, TimingEngine::LegacyFrameClock);
     }
 
     #[test]

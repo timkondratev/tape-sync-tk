@@ -7,7 +7,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::execute;
 use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 
-use crate::config::{AppConfig, Fps, Mode};
+use crate::config::{AppConfig, Fps, Mode, TimingEngine};
 use crate::startup::{AudioDeviceInfo, SystemInventory};
 
 #[derive(Debug, Clone)]
@@ -147,7 +147,7 @@ fn edit_settings<K: KeySource, W: Write>(
     config: &mut AppConfig,
     inventory: &SystemInventory,
 ) -> Result<Flow, TextUiError> {
-    const HELP: [&str; 20] = [
+    const HELP: [&str; 21] = [
         "Audio device and zero-based channel used to decode LTC from tape.",
         "Audio device and zero-based channel used to generate LTC for tape.",
         "Audio stream sample rate. Both generator and decoder support 44100 or 48000 Hz.",
@@ -158,6 +158,7 @@ fn edit_settings<K: KeySource, W: Write>(
         "Tempo low-pass smoothing from 0.01 to 1.0. Lower values smooth more slowly.",
         "Decoded LTC frames used for the measured frame-rate sliding window (1 to 120).",
         "Invalid decode windows before timing metrics reset (1 to 120).",
+        "Hardened uses the independent clock scheduler. Legacy frame clock is a temporary rollback path for field comparison.",
         "Known audio output latency in milliseconds (-500 to 500).",
         "Known tape record/playback path latency in milliseconds (-500 to 500).",
         "Estimated LTC decoder latency in milliseconds (-500 to 500).",
@@ -197,6 +198,7 @@ fn edit_settings<K: KeySource, W: Write>(
                 "Dropout reset",
                 &format!("{} windows", config.decode.dropout_reset_windows),
             ),
+            setting_row("Timing engine", config.decode.timing_engine.as_str()),
             setting_row(
                 "Audio output latency",
                 &format!("{} ms", config.latency_ms.audio_output),
@@ -390,13 +392,37 @@ fn edit_settings<K: KeySource, W: Write>(
                 }
             }
             Choice::Selected(10) => {
+                let current = usize::from(matches!(
+                    config.decode.timing_engine,
+                    TimingEngine::LegacyFrameClock
+                ));
+                match select_fixed(
+                    keys,
+                    output,
+                    "Timing Engine",
+                    &["Hardened scheduler", "Legacy frame clock"],
+                    current,
+                    HELP[10],
+                )? {
+                    FixedChoice::Selected(0) => {
+                        config.decode.timing_engine = TimingEngine::Hardened
+                    }
+                    FixedChoice::Selected(1) => {
+                        config.decode.timing_engine = TimingEngine::LegacyFrameClock
+                    }
+                    FixedChoice::Back => {}
+                    FixedChoice::Quit => return Ok(Flow::Quit),
+                    FixedChoice::Selected(_) => unreachable!(),
+                }
+            }
+            Choice::Selected(11) => {
                 let current = config.latency_ms.audio_output.to_string();
                 if edit_validated(
                     keys,
                     output,
                     config,
                     "Audio Output Latency",
-                    HELP[10],
+                    HELP[11],
                     &current,
                     |candidate, raw| {
                         candidate.latency_ms.audio_output =
@@ -408,14 +434,14 @@ fn edit_settings<K: KeySource, W: Write>(
                     return Ok(Flow::Quit);
                 }
             }
-            Choice::Selected(11) => {
+            Choice::Selected(12) => {
                 let current = config.latency_ms.tape_path.to_string();
                 if edit_validated(
                     keys,
                     output,
                     config,
                     "Tape Path Latency",
-                    HELP[11],
+                    HELP[12],
                     &current,
                     |candidate, raw| {
                         candidate.latency_ms.tape_path = parse_value(raw, "tape path latency")?;
@@ -426,14 +452,14 @@ fn edit_settings<K: KeySource, W: Write>(
                     return Ok(Flow::Quit);
                 }
             }
-            Choice::Selected(12) => {
+            Choice::Selected(13) => {
                 let current = config.latency_ms.decoder.to_string();
                 if edit_validated(
                     keys,
                     output,
                     config,
                     "Decoder Latency",
-                    HELP[12],
+                    HELP[13],
                     &current,
                     |candidate, raw| {
                         candidate.latency_ms.decoder = parse_value(raw, "decoder latency")?;
@@ -444,14 +470,14 @@ fn edit_settings<K: KeySource, W: Write>(
                     return Ok(Flow::Quit);
                 }
             }
-            Choice::Selected(13) => {
+            Choice::Selected(14) => {
                 let current = config.latency_ms.manual.to_string();
                 if edit_validated(
                     keys,
                     output,
                     config,
                     "Manual Latency",
-                    HELP[13],
+                    HELP[14],
                     &current,
                     |candidate, raw| {
                         candidate.latency_ms.manual = parse_value(raw, "manual latency")?;
@@ -462,14 +488,14 @@ fn edit_settings<K: KeySource, W: Write>(
                     return Ok(Flow::Quit);
                 }
             }
-            Choice::Selected(14) => {
+            Choice::Selected(15) => {
                 let current = config.midi.port_name.clone();
                 if edit_validated(
                     keys,
                     output,
                     config,
                     "MIDI Port Name",
-                    HELP[14],
+                    HELP[15],
                     &current,
                     |candidate, raw| {
                         candidate.midi.port_name = raw.to_string();
@@ -480,19 +506,19 @@ fn edit_settings<K: KeySource, W: Write>(
                     return Ok(Flow::Quit);
                 }
             }
-            Choice::Selected(15) => {
-                match edit_bool(keys, output, "Send MTC", HELP[15], config.midi.send_mtc)? {
+            Choice::Selected(16) => {
+                match edit_bool(keys, output, "Send MTC", HELP[16], config.midi.send_mtc)? {
                     BoolChoice::Value(value) => config.midi.send_mtc = value,
                     BoolChoice::Back => {}
                     BoolChoice::Quit => return Ok(Flow::Quit),
                 }
             }
-            Choice::Selected(16) => {
+            Choice::Selected(17) => {
                 match edit_bool(
                     keys,
                     output,
                     "Send MIDI Clock",
-                    HELP[16],
+                    HELP[17],
                     config.midi.send_clock,
                 )? {
                     BoolChoice::Value(value) => config.midi.send_clock = value,
@@ -500,25 +526,25 @@ fn edit_settings<K: KeySource, W: Write>(
                     BoolChoice::Quit => return Ok(Flow::Quit),
                 }
             }
-            Choice::Selected(17) => match edit_bool(
+            Choice::Selected(18) => match edit_bool(
                 keys,
                 output,
                 "Send MIDI Transport",
-                HELP[17],
+                HELP[18],
                 config.midi.send_transport,
             )? {
                 BoolChoice::Value(value) => config.midi.send_transport = value,
                 BoolChoice::Back => {}
                 BoolChoice::Quit => return Ok(Flow::Quit),
             },
-            Choice::Selected(18) => {
+            Choice::Selected(19) => {
                 match select_fixed(
                     keys,
                     output,
                     "Load Defaults",
                     &["Cancel", "Load defaults"],
                     0,
-                    HELP[18],
+                    HELP[19],
                 )? {
                     FixedChoice::Selected(1) => {
                         let mode = config.mode.clone();
@@ -531,7 +557,7 @@ fn edit_settings<K: KeySource, W: Write>(
                     FixedChoice::Selected(_) => unreachable!(),
                 }
             }
-            Choice::Selected(19) | Choice::Back => return Ok(Flow::Back),
+            Choice::Selected(20) | Choice::Back => return Ok(Flow::Back),
             Choice::Quit => return Ok(Flow::Quit),
             Choice::Selected(_) => unreachable!(),
         }
@@ -1102,6 +1128,7 @@ mod tests {
             "Timecode start",
             "Reference BPM",
             "FPS estimate window",
+            "Timing engine",
             "Manual latency",
             "MIDI port name",
             "Send MIDI transport",
@@ -1145,6 +1172,28 @@ mod tests {
 
         assert!(rendered.contains("used to decode LTC from tape"));
         assert!(!rendered.contains("h: help"));
+    }
+
+    #[test]
+    fn timing_engine_can_select_legacy_frame_clock() {
+        let mut scripted = vec![KeyPress::Character('3')];
+        scripted.extend(std::iter::repeat_n(KeyPress::Down, 10));
+        scripted.extend([
+            KeyPress::Enter,
+            KeyPress::Character('2'),
+            KeyPress::Character('q'),
+        ]);
+        let mut keys = ScriptedKeys::new(scripted);
+        let mut output = Vec::new();
+
+        let action = run_with_keys(&mut keys, &mut output, config(), &inventory())
+            .expect("timing engine should be selectable");
+        let config = match action {
+            MenuAction::Quit(config) => config,
+            MenuAction::Start(_) => panic!("expected quit action"),
+        };
+
+        assert_eq!(config.decode.timing_engine, TimingEngine::LegacyFrameClock);
     }
 
     #[test]

@@ -217,6 +217,7 @@ ref_fps = 30.0
 smoothing_alpha = 0.15
 
 [decode]
+timing_engine = "hardened"
 fps_estimate_window_frames = 12
 dropout_reset_windows = 8
 
@@ -242,6 +243,7 @@ send_transport = true
 - timecode.ltc_fps and tempo.ref_fps: allowed values 24.0, 25.0, 29.97, 30.0.
 - tempo.ref_bpm: reference BPM at reference speed.
 - tempo.smoothing_alpha: 0.01 to 1.0.
+- decode.timing_engine: `hardened` uses independently scheduled MIDI clock; `legacy_frame_clock` is a temporary emergency rollback and field-comparison path. Only one path emits MIDI at a time, and omitted values default to `hardened`.
 - decode.fps_estimate_window_frames: 1 to 120.
 - decode.dropout_reset_windows: 1 to 120.
 - midi.port_name: virtual MIDI output name presented to other applications.
