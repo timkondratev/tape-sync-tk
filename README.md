@@ -269,6 +269,19 @@ cargo run
 
 This is an MVP-focused engine. Non-goals currently include DAW-specific APIs, plugin formats, auto tempo-map extraction from arbitrary audio, and multi-machine tape chase.
 
+### Interactive latency calibration
+
+A future calibration wizard should estimate `[latency_ms]` values without requiring manual timing calculations:
+
+1. Select calibration output and input routes.
+2. Measure a direct audio-interface loopback baseline using emitted pulses and a known LTC sequence.
+3. Repeat the measurement through the tape record/playback path.
+4. Estimate decoder timing from the known LTC sample positions and separate tape-path delay from the direct-loopback baseline.
+5. Run several passes, report median delay, jitter, and confidence, then preview suggested latency values.
+6. Write the suggested settings only after explicit user confirmation.
+
+The wizard should preserve `latency_ms.manual` for final DAW alignment. Audio-only calibration cannot determine every DAW, MIDI driver, or external-device delay; a later MIDI-loopback stage may cover those paths.
+
 ## License
 
 This project is licensed under the MIT License.

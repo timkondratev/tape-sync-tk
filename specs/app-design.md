@@ -344,8 +344,42 @@ MIDI side effects:
 - Drop-frame support details for `29.97 DF`.
 - Advanced reverse playback policy beyond ignore/suppress behavior.
 - UI polish beyond basic status + config editing.
+- Interactive latency calibration as specified in Section 11.1.
 
 These are intentionally deferred; they do not block MVP coding.
+
+### 11.1 Interactive Latency Calibration (Roadmap)
+
+Goal:
+
+- Provide a guided text-UI workflow that measures the system path and proposes `[latency_ms]` values instead of requiring users to calculate them manually.
+
+Proposed workflow:
+
+1. Let the user select calibration output/input devices and channels from current system inventory.
+2. Emit a deterministic pulse train followed by a known LTC sequence while capturing the selected input.
+3. For a direct cable loopback, correlate emitted and captured samples to estimate the audio-interface baseline.
+4. Ask the user to route and record the same signal through tape, then repeat capture during playback.
+5. Subtract the direct-loopback baseline from the tape measurement to estimate `latency_ms.tape_path`.
+6. Compare known LTC frame sample positions with decoder frame events to estimate `latency_ms.decoder`.
+7. Repeat each measurement, reject outliers, and report median delay, jitter, sample count, and confidence.
+8. Preview proposed field values and `total_latency_ms`; persist them only after explicit confirmation.
+
+Safety and behavior requirements:
+
+- Never begin output, recording, or settings replacement without an explicit user action.
+- Preserve existing settings if calibration is cancelled, fails, clips, receives no return signal, or has low confidence.
+- Detect clipped, silent, inverted, and ambiguous correlation results and provide a retry path.
+- Support both `44100 Hz` and `48000 Hz`; compute milliseconds from the actual stream sample rate.
+- Keep `latency_ms.manual` user-controlled for final DAW/external-device alignment.
+- State clearly that audio-only calibration does not measure DAW processing, MIDI driver scheduling, or downstream hardware latency. MIDI loopback calibration is a possible later extension.
+
+Proposed acceptance criteria:
+
+- Direct-loopback estimates are repeatable within `+-1 ms` across five clean runs on supported hardware.
+- Added tape-path delay is reported within `+-5 ms` of a fixture or independently measured reference.
+- Suggested values are never written before confirmation and cancellation leaves the prior config unchanged.
+- Automated tests cover correlation, outlier rejection, unit conversion, confidence thresholds, and config proposal generation; physical loopback/tape tests remain manual hardware validation.
 
 ## 12. Testing Requirements
 
