@@ -172,42 +172,51 @@ fn edit_settings<K: KeySource, W: Write>(
 
     loop {
         let items = vec![
-            format!(
-                "Input: {}",
-                route_summary(config, inventory, AudioDirection::Input)
+            setting_row(
+                "Input",
+                &route_summary(config, inventory, AudioDirection::Input),
             ),
-            format!(
-                "Output: {}",
-                route_summary(config, inventory, AudioDirection::Output)
+            setting_row(
+                "Output",
+                &route_summary(config, inventory, AudioDirection::Output),
             ),
-            format!("Sample rate: {} Hz", config.audio.sample_rate),
-            format!("Timecode start: {}", config.timecode.start),
-            format!("LTC FPS: {}", config.timecode.ltc_fps.as_f64()),
-            format!("Reference BPM: {}", config.tempo.ref_bpm),
-            format!("Reference FPS: {}", config.tempo.ref_fps.as_f64()),
-            format!("Tempo smoothing alpha: {}", config.tempo.smoothing_alpha),
-            format!(
-                "FPS estimate window: {} frames",
-                config.decode.fps_estimate_window_frames
+            setting_row("Sample rate", &format!("{} Hz", config.audio.sample_rate)),
+            setting_row("Timecode start", &config.timecode.start),
+            setting_row("LTC FPS", &config.timecode.ltc_fps.as_f64().to_string()),
+            setting_row("Reference BPM", &config.tempo.ref_bpm.to_string()),
+            setting_row("Reference FPS", &config.tempo.ref_fps.as_f64().to_string()),
+            setting_row(
+                "Tempo smoothing alpha",
+                &config.tempo.smoothing_alpha.to_string(),
             ),
-            format!(
-                "Dropout reset: {} windows",
-                config.decode.dropout_reset_windows
+            setting_row(
+                "FPS estimate window",
+                &format!("{} frames", config.decode.fps_estimate_window_frames),
             ),
-            format!(
-                "Audio output latency: {} ms",
-                config.latency_ms.audio_output
+            setting_row(
+                "Dropout reset",
+                &format!("{} windows", config.decode.dropout_reset_windows),
             ),
-            format!("Tape path latency: {} ms", config.latency_ms.tape_path),
-            format!("Decoder latency: {} ms", config.latency_ms.decoder),
-            format!("Manual latency: {} ms", config.latency_ms.manual),
-            format!("MIDI port name: {}", config.midi.port_name),
-            format!("Send MTC: {}", enabled(config.midi.send_mtc)),
-            format!("Send MIDI clock: {}", enabled(config.midi.send_clock)),
-            format!(
-                "Send MIDI transport: {}",
-                enabled(config.midi.send_transport)
+            setting_row(
+                "Audio output latency",
+                &format!("{} ms", config.latency_ms.audio_output),
             ),
+            setting_row(
+                "Tape path latency",
+                &format!("{} ms", config.latency_ms.tape_path),
+            ),
+            setting_row(
+                "Decoder latency",
+                &format!("{} ms", config.latency_ms.decoder),
+            ),
+            setting_row(
+                "Manual latency",
+                &format!("{} ms", config.latency_ms.manual),
+            ),
+            setting_row("MIDI port name", &config.midi.port_name),
+            setting_row("Send MTC", enabled(config.midi.send_mtc)),
+            setting_row("Send MIDI clock", enabled(config.midi.send_clock)),
+            setting_row("Send MIDI transport", enabled(config.midi.send_transport)),
             "Load defaults".to_string(),
             "Back".to_string(),
         ];
@@ -527,6 +536,14 @@ fn edit_settings<K: KeySource, W: Write>(
             Choice::Selected(_) => unreachable!(),
         }
     }
+}
+
+fn setting_row(name: &str, value: &str) -> String {
+    const NAME_COLUMN_WIDTH: usize = 24;
+    let leader_length = NAME_COLUMN_WIDTH
+        .saturating_sub(name.chars().count())
+        .max(3);
+    format!("{name} {} {value}", ".".repeat(leader_length))
 }
 
 fn enabled(value: bool) -> &'static str {
@@ -873,6 +890,7 @@ fn choose<K: KeySource, W: Write>(
     initial: usize,
 ) -> Result<Choice, TextUiError> {
     let mut selected = initial.min(items.len() - 1);
+    let number_width = items.len().to_string().len();
     loop {
         execute!(output, Clear(ClearType::All), MoveTo(0, 0))?;
         writeln!(output, "{title}\r")?;
@@ -881,7 +899,7 @@ fn choose<K: KeySource, W: Write>(
         }
         for (index, item) in items.iter().enumerate() {
             let marker = if index == selected { ">" } else { " " };
-            writeln!(output, "{marker} {}. {item}\r", index + 1)?;
+            writeln!(output, "{marker} {:>number_width$}. {item}\r", index + 1)?;
         }
         output.flush()?;
 
@@ -1091,6 +1109,25 @@ mod tests {
         ] {
             assert!(rendered.contains(label), "missing setting label: {label}");
         }
+    }
+
+    #[test]
+    fn settings_align_names_and_values_with_dotted_leaders() {
+        let short = setting_row("LTC FPS", "30");
+        let long = setting_row("Tempo smoothing alpha", "0.15");
+
+        assert_eq!(short.find("30"), long.find("0.15"));
+        assert!(short.contains("LTC FPS ..."));
+        assert!(long.contains("Tempo smoothing alpha ..."));
+
+        let mut keys = ScriptedKeys::new([KeyPress::Character('3'), KeyPress::Character('q')]);
+        let mut output = Vec::new();
+        run_with_keys(&mut keys, &mut output, config(), &inventory())
+            .expect("settings should render");
+        let rendered = String::from_utf8(output).expect("output should be UTF-8");
+
+        assert!(rendered.contains(">  1. Input"));
+        assert!(rendered.contains("  10. Dropout reset"));
     }
 
     #[test]
