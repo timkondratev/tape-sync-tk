@@ -114,15 +114,48 @@ Use a Tascam PortaStudio as the transport master and have Ableton Live chase tap
 1. Reserve one PortaStudio track for LTC only (commonly track 4 or track 8).
 2. Connect your audio interface output to the PortaStudio input used for striping LTC.
 3. Connect the PortaStudio LTC playback output to your audio interface input channel configured in Tape Sync TK.
-4. In Ableton Live, select the Tape Sync TK virtual MIDI output port and enable external sync.
+
+### Exact Ableton Live 12 settings
+
+Tape Sync TK creates its virtual MIDI port only while Generate or Decode is running. Select Decode first and leave it running while configuring Live; Live can then discover the port and normally remembers it by name.
+
+1. In Tape Sync TK Settings, use these MIDI values:
+  - MIDI port name: `TapeSync MIDI Out`
+  - Send MIDI clock: Enabled
+  - Send MIDI transport: Enabled
+  - Send MTC: Disabled
+2. Select Decode so the virtual MIDI port exists.
+3. In Live, open **Settings > Tempo & MIDI** (`Cmd+,` on macOS).
+4. In **MIDI Ports**, select the input named `TapeSync MIDI Out` and set:
+  - Sync: On. Some Live 12 revisions show this input setting as Sync to Live.
+  - MIDI Sync Type: MIDI Clock, if the type chooser is shown.
+  - Track: Off
+  - Remote: Off
+  - MPE: Off, if shown
+  - Sync Delay: `0.00 ms` initially
+5. Do not add Tape Sync TK as a Control Surface; it is a sync source, not a control surface.
+6. Ensure Tempo Follower is Off. Tempo Follower and External Sync cannot receive tempo simultaneously.
+7. Turn on **EXT** in Live's Control Bar. If it is not visible, enable the TapeSync sync input first; Live shows EXT when an external source is configured. The upper EXT indicator should flash when usable sync messages arrive.
+8. Turn Live's Arrangement Loop switch Off while checking tape position. With Loop enabled, incoming Song Position Pointer values wrap into the loop region.
+
+![Ableton Live 12 Tempo and MIDI settings configured for TapeSync MIDI input](media/ableton_12_settings.png)
+
+*Ableton Live 12 Tempo & MIDI settings with the TapeSync MIDI input configured as an external MIDI Clock source.*
+
+Live accepts Tape Sync TK's MIDI Clock, transport, and Song Position Pointer in this setup. Do not choose MIDI Timecode: Tape Sync TK's Send MTC option is reserved and currently emits no MTC. See Ableton's [Synchronizing with Link, Tempo Follower, and MIDI](https://www.ableton.com/en/live-manual/12/synchronizing-with-link-tempo-follower-and-midi/) documentation for Live's external-sync behavior.
+
+Tape Sync TK maps LTC `01:00:00:00` to MIDI Song Position Pointer zero, which is Live Arrangement position `1.1.1`. For the standard workflow, keep Timecode start at `01:00:00:00` and set Reference BPM to the desired Live tempo at normal tape speed.
+
+Keep Live's Sync Delay at zero while setting Tape Sync TK latency. After the Tape Sync TK latency fields are calibrated, use either Live's Sync Delay or Tape Sync TK's Manual latency for final correction, not both, to avoid double compensation.
 
 ### Workflow
 
 1. Open Settings and select the audio output used for striping and the audio input used for LTC playback.
 2. Select Generate and record LTC to the dedicated PortaStudio track.
 3. Press `Esc` or `b` to return to the menu, then rewind the tape.
-4. Select Decode and start playback on the PortaStudio.
-5. Tape Sync TK decodes LTC and emits MIDI SPP/transport/clock so Ableton Live follows tape position and speed.
+4. Select Decode and configure Ableton Live as described above while Tape Sync TK keeps the virtual port open.
+5. Start playback on the PortaStudio.
+6. Tape Sync TK decodes LTC and emits MIDI SPP/transport/clock so Ableton Live follows tape position and speed.
 
 ### What to verify during testing
 
@@ -257,6 +290,9 @@ If absolute total latency exceeds 1000 ms, startup prints a warning.
 
 - Confirm the DAW is listening to the virtual port shown by MIDI port name in Settings.
 - Confirm Send MIDI clock and Send MIDI transport are enabled.
+- In Live's Tempo & MIDI Settings, confirm Sync is enabled for the TapeSync input and MIDI Sync Type is MIDI Clock.
+- Confirm Live's EXT switch is on and its upper sync indicator flashes during locked tape playback.
+- Turn Tempo Follower off; it prevents Live from receiving External Sync.
 - Confirm LTC signal level and routing into configured input channel.
 - MIDI Time Code is not emitted in the current MVP, even if Send MTC is enabled.
 
