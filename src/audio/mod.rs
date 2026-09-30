@@ -555,6 +555,7 @@ pub fn device_name(device: &Device) -> Result<String, RuntimeError> {
 mod tests {
     use super::*;
     use crate::config::Fps;
+    use crate::test_alloc::count_allocations;
 
     fn generator() -> LtcGenerator {
         LtcGenerator::new(
@@ -611,6 +612,66 @@ mod tests {
         assert_eq!(consumer.pop_slice(&mut selected), 2);
         assert_eq!(selected, [0.2, 0.4]);
         assert_eq!(health.dropped_sample_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn input_callbacks_allocate_no_memory() {
+        let f32_ring = HeapRb::<f32>::new(32);
+        let (mut f32_producer, _f32_consumer) = f32_ring.split();
+        let i16_ring = HeapRb::<f32>::new(32);
+        let (mut i16_producer, _i16_consumer) = i16_ring.split();
+        let u16_ring = HeapRb::<f32>::new(32);
+        let (mut u16_producer, _u16_consumer) = u16_ring.split();
+        let worker_thread = thread::current();
+        let health = DecodeWorkerHealth::default();
+
+        let allocation_count = count_allocations(|| {
+            enqueue_f32_input(
+                &[0.1, 0.2, 0.3, 0.4],
+                2,
+                1,
+                &mut f32_producer,
+                &worker_thread,
+                &health,
+            );
+            enqueue_i16_input(
+                &[100, 200, 300, 400],
+                2,
+                1,
+                &mut i16_producer,
+                &worker_thread,
+                &health,
+            );
+            enqueue_u16_input(
+                &[100, 200, 300, 400],
+                2,
+                1,
+                &mut u16_producer,
+                &worker_thread,
+                &health,
+            );
+        });
+
+        assert_eq!(allocation_count, 0);
+    }
+
+    #[test]
+    fn sustained_callback_load_keeps_up_without_drops() {
+        let ring = HeapRb::<f32>::new(1024);
+        let (mut producer, mut consumer) = ring.split();
+        let worker_thread = thread::current();
+        let health = DecodeWorkerHealth::default();
+        let interleaved = [0.25_f32; 512];
+        let mut drained = [0.0_f32; 256];
+        let mut total_samples = 0usize;
+
+        for _ in 0..10_000 {
+            enqueue_f32_input(&interleaved, 2, 1, &mut producer, &worker_thread, &health);
+            total_samples += consumer.pop_slice(&mut drained);
+        }
+
+        assert_eq!(total_samples, 2_560_000);
+        assert_eq!(health.dropped_sample_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
