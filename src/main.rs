@@ -119,6 +119,12 @@ fn run_mode<W: Write>(
         match text_ui::poll_key(Duration::from_millis(100))? {
             Some(KeyPress::Back) => return Ok(RuntimeAction::Back),
             Some(KeyPress::Quit) => return Ok(RuntimeAction::Quit),
+            Some(KeyPress::Character(character)) if character.eq_ignore_ascii_case(&'b') => {
+                return Ok(RuntimeAction::Back);
+            }
+            Some(KeyPress::Character(character)) if character.eq_ignore_ascii_case(&'q') => {
+                return Ok(RuntimeAction::Quit);
+            }
             _ => {}
         }
     }

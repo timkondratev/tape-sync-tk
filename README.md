@@ -90,7 +90,7 @@ cargo run -- --config path/to/your-config.toml
 
 The terminal menu lets you select Generate, Decode, or Settings. Choices react immediately to number keys; arrow keys and Enter also work. Use `Esc` or `b` to go back from settings or a running mode, and `q` or Ctrl-C to quit.
 
-The startup screen shows the current audio routes and sample rate. Generate and Decode reuse the saved device/channel without asking again while that route remains available. Change routing under Settings, where devices are listed from those currently available on your system. Settings are saved automatically to `tape-sync.toml`, or to the path passed with `--config`.
+The startup screen shows the current audio routes and sample rate. Generate and Decode reuse the saved device/channel without asking again while that route remains available. Settings exposes every persisted option; selecting one shows its help directly on the editing screen. Choose Load Defaults to review its explanation and reset all settings. Settings are saved automatically to `tape-sync.toml`, or to the path passed with `--config`.
 
 Stop with Ctrl-C.
 
@@ -153,13 +153,11 @@ In decode mode, the app shows a live status line with lock state, direction, dec
 
 ## Configuration Reference
 
-The app stores settings as TOML at `tape-sync.toml` by default. The text UI manages the settings required for normal use, so hand editing is not required. Values not yet exposed by the basic UI retain their saved values or built-in defaults.
+The app stores settings as TOML at `tape-sync.toml` by default. Every persisted value is editable through the text UI, so hand editing is not required. Generate and Decode are runtime choices and are not stored as settings.
 
 Example shape:
 
 ```toml
-mode = "generate"
-
 [audio]
 sample_rate = 44100
 input_device = "Replace with an available input device"
@@ -195,7 +193,6 @@ send_transport = true
 
 ### Key fields
 
-- mode: generate or decode.
 - audio.sample_rate: currently 44100 or 48000.
 - timecode.start: HH:MM:SS:FF timecode start.
 - timecode.ltc_fps and tempo.ref_fps: allowed values 24.0, 25.0, 29.97, 30.0.

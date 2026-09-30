@@ -408,10 +408,8 @@ mod tests {
     }
 
     fn config(mode: &str) -> AppConfig {
-        AppConfig::from_toml_str(&format!(
+        let mut config = AppConfig::from_toml_str(
             r#"
-mode = "{mode}"
-
 [audio]
 sample_rate = 44100
 input_device = "Input A"
@@ -443,9 +441,15 @@ port_name = "TapeSync MIDI Out"
 send_mtc = false
 send_clock = true
 send_transport = true
-"#
-        ))
-        .expect("config should parse")
+"#,
+        )
+        .expect("config should parse");
+        config.mode = match mode {
+            "generate" => Mode::Generate,
+            "decode" => Mode::Decode,
+            _ => panic!("unsupported test mode"),
+        };
+        config
     }
 
     #[test]

@@ -42,10 +42,12 @@ Normal startup opens a terminal menu with `Generate`, `Decode`, `Settings`, and 
 
 - Menus react to each key press immediately; Enter is not required for numbered choices.
 - Arrow keys and Enter are also supported for lists longer than nine items.
-- The startup screen displays the current mode, sample rate, input route, and output route.
+- The startup screen displays the current sample rate, input route, and output route.
 - Generate starts immediately with the saved output device/channel when that route is still available.
 - Decode starts immediately with the saved input device/channel when that route is still available.
-- Settings allows input routing, output routing, and sample rate to be changed, then returns to mode selection.
+- Settings exposes every persisted configuration field, including routing, timecode, tempo, decoder, latency, and MIDI values.
+- Entering a settings editor renders contextual help for that option alongside its controls.
+- Settings includes Load Defaults, which restores built-in values and resolves available audio routes.
 - Device lists contain only currently available devices that support the required direction.
 - `Esc` or `b` moves back from settings, device/channel selection, and a running mode. Returning from a running mode stops its audio and MIDI resources cleanly.
 - `q` or Ctrl-C exits from any screen.
@@ -104,11 +106,9 @@ Clock scheduler precision contract (MVP):
 
 ## 6. Configuration Model
 
-Minimal config keys required for coding:
+Persisted config keys required for coding (operating mode is selected at runtime and is not stored):
 
 ```toml
-mode = "generate" # or "decode"
-
 [audio]
 sample_rate = 44100
 input_device = "..."

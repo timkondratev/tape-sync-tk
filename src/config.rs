@@ -14,6 +14,12 @@ pub enum Mode {
     Decode,
 }
 
+impl Default for Mode {
+    fn default() -> Self {
+        Self::Generate
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fps {
     Fps24,
@@ -104,6 +110,7 @@ fn parse_fps(value: f64) -> Result<Fps, String> {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
+    #[serde(skip)]
     pub mode: Mode,
     pub audio: AudioConfig,
     pub timecode: TimecodeConfig,
@@ -354,8 +361,6 @@ mod tests {
 
     fn valid_config() -> &'static str {
         r#"
-mode = "generate"
-
 [audio]
 sample_rate = 44100
 input_device = "Input A"
@@ -463,9 +468,18 @@ send_transport = true
         let serialized = toml::to_string_pretty(&config).expect("config should serialize");
         let restored = AppConfig::from_toml_str(&serialized).expect("saved config should parse");
 
+        assert!(!serialized.contains("mode ="));
         assert_eq!(restored.mode, Mode::Generate);
         assert_eq!(restored.audio.output_device, "Output A");
         assert_eq!(restored.audio.output_channel, 1);
         assert_eq!(restored.timecode.ltc_fps, Fps::Fps30);
+    }
+
+    #[test]
+    fn legacy_mode_field_is_ignored() {
+        let raw = format!("mode = \"decode\"\n{}", valid_config());
+        let config = AppConfig::from_toml_str(&raw).expect("legacy config should parse");
+
+        assert_eq!(config.mode, Mode::Generate);
     }
 }
