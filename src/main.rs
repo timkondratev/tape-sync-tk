@@ -123,6 +123,13 @@ fn run_mode<W: Write>(
                     scheduler.last_error.as_deref().unwrap_or("-")
                 )?;
             }
+            if let Some(worker) = runtime.decode_worker_status_snapshot() {
+                writeln!(
+                    output,
+                    "decoder running={} dropped_samples={}\r",
+                    worker.running, worker.dropped_sample_count
+                )?;
+            }
             writeln!(output, "\rEsc/b: back to menu    q/Ctrl-C: quit\r")?;
             output.flush()?;
             last_status = status;

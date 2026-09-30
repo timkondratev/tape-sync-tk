@@ -1,4 +1,4 @@
-use crate::audio::{self, AudioEndpoint, AudioRuntime};
+use crate::audio::{self, AudioEndpoint, AudioRuntime, DecodeWorkerStatus};
 use crate::config::{AppConfig, Mode};
 use crate::ltc::{
     DecodeRequest, DecodeStatus, GeneratorRequest, SharedDecodeStatusHandler, Timecode,
@@ -34,6 +34,15 @@ impl<A, S, M> StartupRuntime<A, S, M> {
 
     pub fn scheduler_status_snapshot(&self) -> Option<SchedulerStatus> {
         self.scheduler.as_ref().map(SchedulerRuntime::status)
+    }
+
+    pub fn decode_worker_status_snapshot(&self) -> Option<DecodeWorkerStatus> {
+        match &self.audio {
+            AudioRuntime::Decode { input } => {
+                input.decode_worker.as_ref().map(|worker| worker.status())
+            }
+            AudioRuntime::Generate { .. } => None,
+        }
     }
 }
 
@@ -318,6 +327,7 @@ mod tests {
                 decode_status: Some(std::sync::Arc::new(std::sync::Mutex::new(
                     crate::ltc::DecodeStatus::default(),
                 ))),
+                decode_worker: None,
             })
         }
 
@@ -341,6 +351,7 @@ mod tests {
                 channel: request.channel,
                 stream: FakeStream,
                 decode_status: None,
+                decode_worker: None,
             })
         }
 
@@ -457,6 +468,7 @@ send_transport = true
 
         assert_eq!(runtime.midi_port_name, "TapeSync MIDI Out");
         assert!(runtime.scheduler_status_snapshot().is_none());
+        assert!(runtime.decode_worker_status_snapshot().is_none());
     }
 
     #[test]
@@ -550,5 +562,6 @@ send_transport = true
         assert!(snapshot.smoothed_tempo_bpm.is_some());
         assert!(matches!(snapshot.direction, PlaybackDirection::Forward));
         assert!(runtime.scheduler_status_snapshot().is_some());
+        assert!(runtime.decode_worker_status_snapshot().is_none());
     }
 }

@@ -1,6 +1,13 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfigRange};
-use std::sync::{Arc, Mutex};
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::thread::{self, JoinHandle, Thread};
+use std::time::Duration;
 
 use crate::ltc::{
     DecodeMonitor, DecodeRequest, DecodeStatus, GeneratorRequest, LtcGenerator,
@@ -10,7 +17,8 @@ use crate::runtime::RuntimeError;
 
 pub type SharedDecodeStatus = Arc<Mutex<DecodeStatus>>;
 
-type SharedDecodeMonitor = Arc<Mutex<DecodeMonitor>>;
+const DECODE_WORK_CHUNK_SAMPLES: usize = 1024;
+const DECODE_WORKER_IDLE_WAIT: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub enum AudioRuntime<A = Device, S = Stream> {
@@ -25,6 +33,45 @@ pub struct AudioEndpoint<A, S> {
     pub channel: u16,
     pub stream: S,
     pub decode_status: Option<SharedDecodeStatus>,
+    pub decode_worker: Option<DecodeWorkerRuntime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeWorkerStatus {
+    pub running: bool,
+    pub dropped_sample_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct DecodeWorkerHealth {
+    running: AtomicBool,
+    dropped_sample_count: AtomicU64,
+}
+
+#[derive(Debug)]
+pub struct DecodeWorkerRuntime {
+    shutdown: Arc<AtomicBool>,
+    health: Arc<DecodeWorkerHealth>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl DecodeWorkerRuntime {
+    pub fn status(&self) -> DecodeWorkerStatus {
+        DecodeWorkerStatus {
+            running: self.health.running.load(Ordering::Relaxed),
+            dropped_sample_count: self.health.dropped_sample_count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for DecodeWorkerRuntime {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
+    }
 }
 
 pub fn open_input_stream(
@@ -46,15 +93,20 @@ pub fn open_input_stream(
     )?;
     let config = supported_to_stream_config(&supported, sample_rate);
     let decode_status = Arc::new(Mutex::new(DecodeStatus::default()));
-    let decode_monitor = Arc::new(Mutex::new(DecodeMonitor::new(decode_request, sample_rate)));
+    let (producer, worker_thread, decode_worker) = spawn_decode_worker(
+        decode_request,
+        sample_rate,
+        &decode_status,
+        decode_status_handler,
+    )?;
     let stream = build_input_stream(
         &device,
         &config,
         supported.sample_format(),
         channel,
-        Arc::clone(&decode_status),
-        decode_monitor,
-        decode_status_handler,
+        producer,
+        worker_thread,
+        Arc::clone(&decode_worker.health),
     )?;
     stream
         .play()
@@ -66,6 +118,7 @@ pub fn open_input_stream(
         channel,
         stream,
         decode_status: Some(decode_status),
+        decode_worker: Some(decode_worker),
     })
 }
 
@@ -103,6 +156,7 @@ pub fn open_output_stream(
         channel,
         stream,
         decode_status: None,
+        decode_worker: None,
     })
 }
 
@@ -173,9 +227,9 @@ fn build_input_stream(
     config: &StreamConfig,
     sample_format: SampleFormat,
     channel: u16,
-    decode_status: SharedDecodeStatus,
-    decode_monitor: SharedDecodeMonitor,
-    decode_status_handler: Option<SharedDecodeStatusHandler>,
+    producer: HeapProd<f32>,
+    worker_thread: Thread,
+    worker_health: Arc<DecodeWorkerHealth>,
 ) -> Result<Stream, RuntimeError> {
     let err_fn = |error| eprintln!("audio input stream error: {error}");
     let channel_count = config.channels as usize;
@@ -183,20 +237,18 @@ fn build_input_stream(
 
     match sample_format {
         SampleFormat::F32 => {
-            let decode_status = Arc::clone(&decode_status);
-            let decode_monitor = Arc::clone(&decode_monitor);
-            let decode_status_handler = decode_status_handler.clone();
+            let mut producer = producer;
             device
                 .build_input_stream(
                     config,
                     move |data: &[f32], _| {
-                        process_f32_input(
+                        enqueue_f32_input(
                             data,
                             channel_count,
                             target_channel,
-                            &decode_status,
-                            &decode_monitor,
-                            decode_status_handler.as_ref(),
+                            &mut producer,
+                            &worker_thread,
+                            &worker_health,
                         )
                     },
                     err_fn,
@@ -205,20 +257,18 @@ fn build_input_stream(
                 .map_err(|source| RuntimeError::AudioStream(source.to_string()))
         }
         SampleFormat::I16 => {
-            let decode_status = Arc::clone(&decode_status);
-            let decode_monitor = Arc::clone(&decode_monitor);
-            let decode_status_handler = decode_status_handler.clone();
+            let mut producer = producer;
             device
                 .build_input_stream(
                     config,
                     move |data: &[i16], _| {
-                        process_i16_input(
+                        enqueue_i16_input(
                             data,
                             channel_count,
                             target_channel,
-                            &decode_status,
-                            &decode_monitor,
-                            decode_status_handler.as_ref(),
+                            &mut producer,
+                            &worker_thread,
+                            &worker_health,
                         )
                     },
                     err_fn,
@@ -227,20 +277,18 @@ fn build_input_stream(
                 .map_err(|source| RuntimeError::AudioStream(source.to_string()))
         }
         SampleFormat::U16 => {
-            let decode_status = Arc::clone(&decode_status);
-            let decode_monitor = Arc::clone(&decode_monitor);
-            let decode_status_handler = decode_status_handler.clone();
+            let mut producer = producer;
             device
                 .build_input_stream(
                     config,
                     move |data: &[u16], _| {
-                        process_u16_input(
+                        enqueue_u16_input(
                             data,
                             channel_count,
                             target_channel,
-                            &decode_status,
-                            &decode_monitor,
-                            decode_status_handler.as_ref(),
+                            &mut producer,
+                            &worker_thread,
+                            &worker_health,
                         )
                     },
                     err_fn,
@@ -318,92 +366,147 @@ fn render_f32_output(
     }
 }
 
-fn process_f32_input(
+fn enqueue_f32_input(
     data: &[f32],
     channel_count: usize,
     target_channel: usize,
-    decode_status: &SharedDecodeStatus,
-    decode_monitor: &SharedDecodeMonitor,
-    decode_status_handler: Option<&SharedDecodeStatusHandler>,
+    producer: &mut HeapProd<f32>,
+    worker_thread: &Thread,
+    worker_health: &DecodeWorkerHealth,
 ) {
-    let selected = extract_f32_channel(data, channel_count, target_channel);
-    update_decode_status(
-        decode_status,
-        decode_monitor,
-        decode_status_handler,
-        &selected,
+    enqueue_input(
+        data.chunks(channel_count)
+            .filter_map(|frame| frame.get(target_channel).copied()),
+        producer,
+        worker_thread,
+        worker_health,
     );
 }
 
-fn process_i16_input(
+fn enqueue_i16_input(
     data: &[i16],
     channel_count: usize,
     target_channel: usize,
-    decode_status: &SharedDecodeStatus,
-    decode_monitor: &SharedDecodeMonitor,
-    decode_status_handler: Option<&SharedDecodeStatusHandler>,
+    producer: &mut HeapProd<f32>,
+    worker_thread: &Thread,
+    worker_health: &DecodeWorkerHealth,
 ) {
-    let selected = data
-        .chunks(channel_count)
-        .filter_map(|frame| frame.get(target_channel).copied())
-        .map(|sample| sample as f32 / i16::MAX as f32)
-        .collect::<Vec<_>>();
-    update_decode_status(
-        decode_status,
-        decode_monitor,
-        decode_status_handler,
-        &selected,
+    enqueue_input(
+        data.chunks(channel_count)
+            .filter_map(|frame| frame.get(target_channel).copied())
+            .map(|sample| sample as f32 / i16::MAX as f32),
+        producer,
+        worker_thread,
+        worker_health,
     );
 }
 
-fn process_u16_input(
+fn enqueue_u16_input(
     data: &[u16],
     channel_count: usize,
     target_channel: usize,
-    decode_status: &SharedDecodeStatus,
-    decode_monitor: &SharedDecodeMonitor,
-    decode_status_handler: Option<&SharedDecodeStatusHandler>,
+    producer: &mut HeapProd<f32>,
+    worker_thread: &Thread,
+    worker_health: &DecodeWorkerHealth,
 ) {
-    let selected = data
-        .chunks(channel_count)
-        .filter_map(|frame| frame.get(target_channel).copied())
-        .map(|sample| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
-        .collect::<Vec<_>>();
-    update_decode_status(
-        decode_status,
-        decode_monitor,
-        decode_status_handler,
-        &selected,
+    enqueue_input(
+        data.chunks(channel_count)
+            .filter_map(|frame| frame.get(target_channel).copied())
+            .map(|sample| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0),
+        producer,
+        worker_thread,
+        worker_health,
     );
 }
 
-fn update_decode_status(
-    decode_status: &SharedDecodeStatus,
-    decode_monitor: &SharedDecodeMonitor,
-    decode_status_handler: Option<&SharedDecodeStatusHandler>,
-    samples: &[f32],
+fn enqueue_input(
+    samples: impl Iterator<Item = f32>,
+    producer: &mut HeapProd<f32>,
+    worker_thread: &Thread,
+    worker_health: &DecodeWorkerHealth,
 ) {
-    let status = if let Ok(mut monitor) = decode_monitor.lock() {
-        monitor.process_samples(samples)
-    } else {
-        DecodeStatus::default()
-    };
-
-    if let Ok(mut shared) = decode_status.lock() {
-        *shared = status.clone();
+    let mut dropped = 0u64;
+    for sample in samples {
+        if producer.try_push(sample).is_err() {
+            dropped += 1;
+        }
     }
-
-    if let Some(handler) = decode_status_handler
-        && let Ok(mut handler) = handler.lock()
-    {
-        handler.handle_status(&status);
+    if dropped > 0 {
+        worker_health
+            .dropped_sample_count
+            .fetch_add(dropped, Ordering::Relaxed);
     }
+    worker_thread.unpark();
 }
 
-fn extract_f32_channel(data: &[f32], channel_count: usize, target_channel: usize) -> Vec<f32> {
-    data.chunks(channel_count)
-        .filter_map(|frame| frame.get(target_channel).copied())
-        .collect()
+fn spawn_decode_worker(
+    decode_request: DecodeRequest,
+    sample_rate: u32,
+    decode_status: &SharedDecodeStatus,
+    decode_status_handler: Option<SharedDecodeStatusHandler>,
+) -> Result<(HeapProd<f32>, Thread, DecodeWorkerRuntime), RuntimeError> {
+    let ring = HeapRb::<f32>::new((sample_rate as usize / 2).max(DECODE_WORK_CHUNK_SAMPLES));
+    let (producer, consumer) = ring.split();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let health = Arc::new(DecodeWorkerHealth::default());
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker_health = Arc::clone(&health);
+    let decode_status = Arc::clone(decode_status);
+    let worker = thread::Builder::new()
+        .name("tape-sync-ltc-decode".to_string())
+        .spawn(move || {
+            run_decode_worker(
+                consumer,
+                DecodeMonitor::new(decode_request, sample_rate),
+                decode_status,
+                decode_status_handler,
+                worker_shutdown,
+                worker_health,
+            )
+        })
+        .map_err(|source| {
+            RuntimeError::AudioStream(format!("failed to start decode worker: {source}"))
+        })?;
+    health.running.store(true, Ordering::Relaxed);
+    let worker_thread = worker.thread().clone();
+    Ok((
+        producer,
+        worker_thread,
+        DecodeWorkerRuntime {
+            shutdown,
+            health,
+            worker: Some(worker),
+        },
+    ))
+}
+
+fn run_decode_worker(
+    mut consumer: HeapCons<f32>,
+    mut decode_monitor: DecodeMonitor,
+    decode_status: SharedDecodeStatus,
+    decode_status_handler: Option<SharedDecodeStatusHandler>,
+    shutdown: Arc<AtomicBool>,
+    health: Arc<DecodeWorkerHealth>,
+) {
+    let mut samples = [0.0; DECODE_WORK_CHUNK_SAMPLES];
+    while !shutdown.load(Ordering::Relaxed) {
+        let sample_count = consumer.pop_slice(&mut samples);
+        if sample_count == 0 {
+            thread::park_timeout(DECODE_WORKER_IDLE_WAIT);
+            continue;
+        }
+
+        let status = decode_monitor.process_samples(&samples[..sample_count]);
+        if let Ok(mut shared) = decode_status.lock() {
+            *shared = status.clone();
+        }
+        if let Some(handler) = &decode_status_handler
+            && let Ok(mut handler) = handler.lock()
+        {
+            handler.handle_status(&status);
+        }
+    }
+    health.running.store(false, Ordering::Relaxed);
 }
 
 fn render_i16_output(
@@ -490,8 +593,71 @@ mod tests {
     }
 
     #[test]
-    fn extracts_requested_input_channel() {
-        let selected = extract_f32_channel(&[0.1, 0.2, 0.3, 0.4], 2, 1);
-        assert_eq!(selected, vec![0.2, 0.4]);
+    fn callback_enqueues_target_channel_and_counts_overflow() {
+        let ring = HeapRb::<f32>::new(2);
+        let (mut producer, mut consumer) = ring.split();
+        let health = DecodeWorkerHealth::default();
+
+        enqueue_f32_input(
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            2,
+            1,
+            &mut producer,
+            &thread::current(),
+            &health,
+        );
+
+        let mut selected = [0.0; 2];
+        assert_eq!(consumer.pop_slice(&mut selected), 2);
+        assert_eq!(selected, [0.2, 0.4]);
+        assert_eq!(health.dropped_sample_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn decode_worker_processes_samples_and_joins_cleanly() {
+        let decode_status = Arc::new(Mutex::new(DecodeStatus::default()));
+        let (mut producer, worker_thread, runtime) = spawn_decode_worker(
+            DecodeRequest {
+                fps: Fps::Fps30,
+                ref_fps: Fps::Fps30,
+                ref_bpm: 120.0,
+                smoothing_alpha: 0.15,
+                fps_estimate_window_size: 12,
+                dropout_reset_windows: 8,
+            },
+            44_100,
+            &decode_status,
+            None,
+        )
+        .expect("decode worker should start");
+        let health = Arc::clone(&runtime.health);
+        let mut generator = generator();
+        let samples = (0..44_100)
+            .map(|_| generator.next_sample())
+            .collect::<Vec<_>>();
+        let pushed = producer.push_slice(&samples);
+        worker_thread.unpark();
+
+        let timeout = std::time::Instant::now() + Duration::from_secs(1);
+        while decode_status
+            .lock()
+            .expect("decode status lock")
+            .decoded_frame_count
+            == 0
+            && std::time::Instant::now() < timeout
+        {
+            thread::yield_now();
+        }
+
+        assert!(pushed > 0);
+        assert!(
+            decode_status
+                .lock()
+                .expect("decode status lock")
+                .decoded_frame_count
+                > 0
+        );
+        drop(runtime);
+        assert!(!health.running.load(Ordering::Relaxed));
     }
 }
