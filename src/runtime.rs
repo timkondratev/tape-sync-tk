@@ -73,6 +73,7 @@ where
             let decode_status_handler = Some(make_decode_status_handler(
                 midi,
                 config.tempo.ref_bpm,
+                config.timecode.ltc_fps,
                 config.total_latency_ms(),
                 config.midi.send_clock,
                 config.midi.send_transport,
@@ -112,6 +113,7 @@ where
 fn make_decode_status_handler<M>(
     midi: M,
     ref_bpm: f64,
+    ltc_fps: crate::config::Fps,
     latency_ms: f64,
     send_clock: bool,
     send_transport: bool,
@@ -123,6 +125,7 @@ where
     let bridge = DecodeSyncBridge::new(
         engine,
         ref_bpm,
+        ltc_fps,
         Timecode {
             hours: 1,
             minutes: 0,

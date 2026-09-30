@@ -469,15 +469,14 @@ pub struct DecodeMonitor {
     sample_offset: usize,
     decoded_frame_count: u64,
     last_timecode: Option<Timecode>,
-    previous_frame_sample: Option<usize>,
-    last_instantaneous_fps: Option<f64>,
-    recent_fps_samples: VecDeque<f64>,
+    timing_reference: Option<(Timecode, usize)>,
+    recent_frame_intervals: VecDeque<(u32, usize)>,
     fps_estimate_window_size: usize,
     dropout_reset_windows: u32,
     measured_fps: Option<f64>,
     smoothed_tempo_bpm: Option<f64>,
     direction: PlaybackDirection,
-    windows_without_decoded_frame: u32,
+    samples_without_decoded_frame: usize,
     samples_since_lock_activity: f64,
 }
 
@@ -497,15 +496,14 @@ impl DecodeMonitor {
             sample_offset: 0,
             decoded_frame_count: 0,
             last_timecode: None,
-            previous_frame_sample: None,
-            last_instantaneous_fps: None,
-            recent_fps_samples: VecDeque::with_capacity(request.fps_estimate_window_size),
+            timing_reference: None,
+            recent_frame_intervals: VecDeque::with_capacity(request.fps_estimate_window_size),
             fps_estimate_window_size: request.fps_estimate_window_size,
             dropout_reset_windows: request.dropout_reset_windows,
             measured_fps: None,
             smoothed_tempo_bpm: None,
             direction: PlaybackDirection::Forward,
-            windows_without_decoded_frame: 0,
+            samples_without_decoded_frame: 0,
             samples_since_lock_activity: 0.0,
         }
     }
@@ -530,12 +528,16 @@ impl DecodeMonitor {
         }
 
         if decoded_timecode.is_some() {
-            self.windows_without_decoded_frame = 0;
+            self.samples_without_decoded_frame = 0;
         } else {
-            self.windows_without_decoded_frame += 1;
-            if self.windows_without_decoded_frame >= self.dropout_reset_windows {
-                self.recent_fps_samples.clear();
-                self.last_instantaneous_fps = None;
+            self.samples_without_decoded_frame = self
+                .samples_without_decoded_frame
+                .saturating_add(samples.len());
+            let reset_after_samples =
+                (self.nominal_samples_per_frame * self.dropout_reset_windows as f64) as usize;
+            if self.samples_without_decoded_frame >= reset_after_samples {
+                self.recent_frame_intervals.clear();
+                self.timing_reference = None;
                 self.measured_fps = None;
                 self.smoothed_tempo_bpm = None;
             }
@@ -559,23 +561,43 @@ impl DecodeMonitor {
             self.direction = infer_direction(previous_timecode, current_timecode, self.fps);
         }
 
-        if let Some(previous_frame_sample) = self.previous_frame_sample {
+        if self.direction == PlaybackDirection::Forward
+            && let Some((previous_timecode, previous_frame_sample)) = self.timing_reference
+        {
+            let frame_delta = forward_frame_delta(previous_timecode, current_timecode, self.fps);
             let sample_delta = frame_sample.saturating_sub(previous_frame_sample);
-            if sample_delta > 0 {
-                let instantaneous_fps = self.sample_rate as f64 / sample_delta as f64;
-                self.last_instantaneous_fps = Some(instantaneous_fps);
-                self.recent_fps_samples.push_back(instantaneous_fps);
-                while self.recent_fps_samples.len() > self.fps_estimate_window_size {
-                    self.recent_fps_samples.pop_front();
+            let max_frame_gap = self.fps.frame_count_base() as u32 * 2;
+            if frame_delta > 0 && frame_delta <= max_frame_gap && sample_delta > 0 {
+                let interval_fps =
+                    self.sample_rate as f64 * frame_delta as f64 / sample_delta as f64;
+                let speed_ratio = interval_fps / self.fps.as_f64();
+                if (MIN_TRACKED_SPEED_RATIO..=MAX_TRACKED_SPEED_RATIO).contains(&speed_ratio) {
+                    self.recent_frame_intervals
+                        .push_back((frame_delta, sample_delta));
+                    while self.recent_frame_intervals.len() > self.fps_estimate_window_size {
+                        self.recent_frame_intervals.pop_front();
+                    }
+
+                    let total_frames = self
+                        .recent_frame_intervals
+                        .iter()
+                        .map(|(frames, _)| *frames as u64)
+                        .sum::<u64>();
+                    let total_samples = self
+                        .recent_frame_intervals
+                        .iter()
+                        .map(|(_, samples)| *samples as u64)
+                        .sum::<u64>();
+                    self.measured_fps =
+                        Some(self.sample_rate as f64 * total_frames as f64 / total_samples as f64);
+                    self.timing_reference = Some((current_timecode, frame_sample));
                 }
-
-                let measured_fps = self.recent_fps_samples.iter().sum::<f64>()
-                    / self.recent_fps_samples.len() as f64;
-                self.measured_fps = Some(measured_fps);
             }
+        } else if self.direction == PlaybackDirection::Forward {
+            self.timing_reference = Some((current_timecode, frame_sample));
+        } else {
+            self.timing_reference = None;
         }
-
-        self.previous_frame_sample = Some(frame_sample);
     }
 
     fn observe_lock_activity(
@@ -598,21 +620,19 @@ impl DecodeMonitor {
     }
 
     fn update_smoothed_tempo(&mut self, lock_status: LockStatus) {
-        let instantaneous_fps = match self.last_instantaneous_fps {
+        let measured_fps = match self.measured_fps {
             Some(value) => value,
             None => return,
         };
 
-        let instantaneous_tempo_bpm = self.ref_bpm * (instantaneous_fps / self.ref_fps.as_f64());
+        let measured_tempo_bpm = self.ref_bpm * (measured_fps / self.ref_fps.as_f64());
 
         self.smoothed_tempo_bpm = Some(match lock_status {
             // During acquisition, prefer immediate tempo readout to avoid startup ramp.
-            LockStatus::Unlocked | LockStatus::Locking => instantaneous_tempo_bpm,
+            LockStatus::Unlocked | LockStatus::Locking => measured_tempo_bpm,
             LockStatus::Locked => match self.smoothed_tempo_bpm {
-                Some(previous) => {
-                    previous + self.smoothing_alpha * (instantaneous_tempo_bpm - previous)
-                }
-                None => instantaneous_tempo_bpm,
+                Some(previous) => previous + self.smoothing_alpha * (measured_tempo_bpm - previous),
+                None => measured_tempo_bpm,
             },
         });
     }
@@ -650,6 +670,11 @@ fn total_frames(timecode: Timecode, fps: Fps) -> i64 {
     (((timecode.hours as i64 * 60 + timecode.minutes as i64) * 60 + timecode.seconds as i64)
         * fps.frame_count_base() as i64)
         + timecode.frames as i64
+}
+
+pub(crate) fn forward_frame_delta(previous: Timecode, current: Timecode, fps: Fps) -> u32 {
+    let frames_per_day = fps.frame_count_base() as i64 * 60 * 60 * 24;
+    (total_frames(current, fps) - total_frames(previous, fps)).rem_euclid(frames_per_day) as u32
 }
 
 fn decode_timecode(bits: [bool; 80], fps: Fps) -> Result<Timecode, LtcError> {
@@ -1087,7 +1112,7 @@ mod tests {
             44_100,
         );
 
-        monitor.last_instantaneous_fps = Some(45.0);
+        monitor.measured_fps = Some(45.0);
         monitor.smoothed_tempo_bpm = Some(100.0);
         monitor.update_smoothed_tempo(LockStatus::Locking);
 
@@ -1096,6 +1121,51 @@ mod tests {
             .smoothed_tempo_bpm
             .expect("tempo should be set during acquisition");
         assert!((actual - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn timing_estimate_accounts_for_missing_ltc_frames() {
+        let mut monitor = DecodeMonitor::default();
+        let first = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 10,
+        };
+        let after_gap = Timecode {
+            frames: 12,
+            ..first
+        };
+
+        monitor.update_timing_metrics(first, 0);
+        monitor.last_timecode = Some(first);
+        monitor.update_timing_metrics(after_gap, 2_940);
+        monitor.update_smoothed_tempo(LockStatus::Locked);
+
+        let measured_fps = monitor.measured_fps.expect("fps should be measured");
+        let measured_bpm = monitor
+            .smoothed_tempo_bpm
+            .expect("tempo should be measured");
+        assert!((measured_fps - 30.0).abs() < 1e-9);
+        assert!((measured_bpm - 120.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forward_frame_delta_handles_midnight_wrap_and_gaps() {
+        let previous = Timecode {
+            hours: 23,
+            minutes: 59,
+            seconds: 59,
+            frames: 29,
+        };
+        let current = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 1,
+        };
+
+        assert_eq!(forward_frame_delta(previous, current, Fps::Fps30), 2);
     }
 
     #[test]
@@ -1149,12 +1219,37 @@ mod tests {
         }
         assert!(monitor.measured_fps.is_some());
 
-        for _ in 0..DEFAULT_DROPOUT_RESET_WINDOWS {
-            let _ = monitor.process_samples(&[0.0; 256]);
-        }
+        let reset_sample_count = (monitor.nominal_samples_per_frame
+            * DEFAULT_DROPOUT_RESET_WINDOWS as f64)
+            .ceil() as usize;
+        let _ = monitor.process_samples(&vec![0.0; reset_sample_count]);
 
         assert!(monitor.measured_fps.is_none());
         assert!(monitor.smoothed_tempo_bpm.is_none());
+    }
+
+    #[test]
+    fn small_audio_callbacks_do_not_reset_metrics_between_ltc_frames() {
+        let mut monitor = DecodeMonitor::new(
+            DecodeRequest {
+                fps: Fps::Fps30,
+                ref_fps: Fps::Fps30,
+                ref_bpm: 120.0,
+                smoothing_alpha: 0.15,
+                fps_estimate_window_size: DEFAULT_FPS_ESTIMATE_WINDOW_SIZE,
+                dropout_reset_windows: DEFAULT_DROPOUT_RESET_WINDOWS,
+            },
+            44_100,
+        );
+        monitor.measured_fps = Some(30.0);
+        monitor.smoothed_tempo_bpm = Some(120.0);
+
+        for _ in 0..8 {
+            let _ = monitor.process_samples(&[0.0; 128]);
+        }
+
+        assert_eq!(monitor.measured_fps, Some(30.0));
+        assert_eq!(monitor.smoothed_tempo_bpm, Some(120.0));
     }
 
     #[test]

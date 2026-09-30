@@ -62,6 +62,10 @@ Current MIDI tests verify message bytes and ordering only. They do not record em
 
 `DecodeStatusHandler::handle_status` discards the result of `handle_status_result`. Persistent MIDI failures can therefore appear as tempo or synchronization instability without an actionable runtime error.
 
+### 3.9 Dropout reset uses callback count as a time unit
+
+The timing reset threshold counts audio callbacks that contain no complete decoded frame. Audio callback size is selected by the backend and is unrelated to LTC frame duration. With 128-sample callbacks at 44.1 kHz, eight callbacks span approximately 23 ms, which is shorter than one 30 fps LTC frame. A valid speed estimate can therefore be erased before the next frame arrives. Dropout and lock thresholds must be measured in samples or monotonic elapsed time.
+
 ## 4. Design Goals
 
 1. Keep estimated BPM within 1% of the known source tempo during steady and slowly drifting playback.

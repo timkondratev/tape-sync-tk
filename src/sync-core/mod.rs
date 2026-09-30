@@ -1,4 +1,7 @@
-use crate::ltc::{DecodeStatus, DecodeStatusHandler, LockStatus, PlaybackDirection, Timecode};
+use crate::config::Fps;
+use crate::ltc::{
+    DecodeStatus, DecodeStatusHandler, LockStatus, PlaybackDirection, Timecode, forward_frame_delta,
+};
 use crate::midi::MidiTransport;
 use crate::runtime::RuntimeError;
 
@@ -71,9 +74,11 @@ impl<P: MidiTransport> SyncEngine<P> {
 pub struct DecodeSyncBridge<P> {
     engine: SyncEngine<P>,
     ref_bpm: f64,
+    ltc_fps: Fps,
     anchor_timecode: Timecode,
     latency_ms: f64,
     last_decoded_frame_count: u64,
+    last_timecode: Option<Timecode>,
     clock_accumulator: f64,
     last_lock_status: LockStatus,
 }
@@ -82,15 +87,18 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
     pub fn new(
         engine: SyncEngine<P>,
         ref_bpm: f64,
+        ltc_fps: Fps,
         anchor_timecode: Timecode,
         latency_ms: f64,
     ) -> Self {
         Self {
             engine,
             ref_bpm,
+            ltc_fps,
             anchor_timecode,
             latency_ms,
             last_decoded_frame_count: 0,
+            last_timecode: None,
             clock_accumulator: 0.0,
             last_lock_status: LockStatus::Unlocked,
         }
@@ -101,10 +109,21 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
     }
 
     fn handle_status_result(&mut self, status: &DecodeStatus) -> Result<(), RuntimeError> {
-        let new_frames = status
-            .decoded_frame_count
-            .saturating_sub(self.last_decoded_frame_count);
+        let has_new_frame = status.decoded_frame_count > self.last_decoded_frame_count;
+        let new_frames = if has_new_frame {
+            match (self.last_timecode, status.current_timecode) {
+                (Some(previous), Some(current)) => {
+                    forward_frame_delta(previous, current, self.ltc_fps) as u64
+                }
+                _ => 0,
+            }
+        } else {
+            0
+        };
         self.last_decoded_frame_count = status.decoded_frame_count;
+        if has_new_frame {
+            self.last_timecode = status.current_timecode;
+        }
         let lock_acquisition =
             self.last_lock_status != LockStatus::Locked && status.lock_status == LockStatus::Locked;
 
@@ -328,6 +347,7 @@ mod tests {
         let mut bridge = DecodeSyncBridge::new(
             engine(),
             120.0,
+            Fps::Fps30,
             Timecode {
                 hours: 1,
                 minutes: 0,
@@ -354,7 +374,25 @@ mod tests {
                 measured_fps: Some(30.0),
                 smoothed_tempo_bpm: Some(120.0),
             })
-            .expect("bridge should emit updates");
+            .expect("bridge should acquire lock");
+        bridge
+            .handle_status_result(&DecodeStatus {
+                lock_status: LockStatus::Locked,
+                direction: PlaybackDirection::Forward,
+                edge_count: 0,
+                consecutive_valid_windows: 9,
+                consecutive_invalid_windows: 0,
+                current_timecode: Some(Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 16,
+                }),
+                decoded_frame_count: 16,
+                measured_fps: Some(30.0),
+                smoothed_tempo_bpm: Some(120.0),
+            })
+            .expect("bridge should emit clock from frame progress");
 
         let connection = bridge.into_engine().into_midi().into_inner();
         assert_eq!(connection.messages.first(), Some(&vec![0xF2, 0x08, 0x00]));
@@ -367,10 +405,56 @@ mod tests {
     }
 
     #[test]
+    fn decode_sync_bridge_preserves_clock_time_across_a_missing_frame() {
+        let mut bridge = DecodeSyncBridge::new(
+            engine(),
+            120.0,
+            Fps::Fps30,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            0.0,
+        );
+
+        for (decoded_frame_count, frames) in [(1, 10), (2, 12)] {
+            bridge
+                .handle_status_result(&DecodeStatus {
+                    lock_status: LockStatus::Locked,
+                    direction: PlaybackDirection::Forward,
+                    edge_count: 0,
+                    consecutive_valid_windows: 8,
+                    consecutive_invalid_windows: 0,
+                    current_timecode: Some(Timecode {
+                        hours: 1,
+                        minutes: 0,
+                        seconds: 0,
+                        frames,
+                    }),
+                    decoded_frame_count,
+                    measured_fps: Some(30.0),
+                    smoothed_tempo_bpm: Some(120.0),
+                })
+                .expect("bridge update should succeed");
+        }
+
+        let connection = bridge.into_engine().into_midi().into_inner();
+        let clock_count = connection
+            .messages
+            .iter()
+            .filter(|message| message.as_slice() == [0xF8])
+            .count();
+        assert_eq!(clock_count, 3);
+    }
+
+    #[test]
     fn decode_sync_bridge_suppresses_reverse_chase_updates() {
         let mut bridge = DecodeSyncBridge::new(
             engine(),
             120.0,
+            Fps::Fps30,
             Timecode {
                 hours: 1,
                 minutes: 0,
