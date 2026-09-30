@@ -57,7 +57,10 @@ impl SystemInventory {
             backend_available: MidiOutput::new("TapeSync startup preflight").is_ok(),
         };
 
-        Ok(Self { audio_devices, midi })
+        Ok(Self {
+            audio_devices,
+            midi,
+        })
     }
 }
 
@@ -67,18 +70,23 @@ pub struct StartupReport {
     pub warnings: Vec<String>,
 }
 
-pub fn preflight(config: &AppConfig, inventory: &SystemInventory) -> Result<StartupReport, StartupError> {
+pub fn preflight(
+    config: &AppConfig,
+    inventory: &SystemInventory,
+) -> Result<StartupReport, StartupError> {
     match config.mode {
         Mode::Generate => {
             let device = inventory
                 .audio_devices
                 .iter()
                 .find(|device| device.name == config.audio.output_device)
-                .ok_or_else(|| StartupError::missing_audio_device(
-                    "output",
-                    &config.audio.output_device,
-                    &inventory.audio_devices,
-                ))?;
+                .ok_or_else(|| {
+                    StartupError::missing_audio_device(
+                        "output",
+                        &config.audio.output_device,
+                        &inventory.audio_devices,
+                    )
+                })?;
             ensure_channel_available(
                 "output",
                 config.audio.output_channel,
@@ -91,11 +99,13 @@ pub fn preflight(config: &AppConfig, inventory: &SystemInventory) -> Result<Star
                 .audio_devices
                 .iter()
                 .find(|device| device.name == config.audio.input_device)
-                .ok_or_else(|| StartupError::missing_audio_device(
-                    "input",
-                    &config.audio.input_device,
-                    &inventory.audio_devices,
-                ))?;
+                .ok_or_else(|| {
+                    StartupError::missing_audio_device(
+                        "input",
+                        &config.audio.input_device,
+                        &inventory.audio_devices,
+                    )
+                })?;
             ensure_channel_available(
                 "input",
                 config.audio.input_channel,
@@ -107,9 +117,7 @@ pub fn preflight(config: &AppConfig, inventory: &SystemInventory) -> Result<Star
 
     if !inventory.midi.backend_available {
         return Err(StartupError {
-            message: format!(
-                "MIDI output backend is unavailable. {RETRY_HINT}"
-            ),
+            message: format!("MIDI output backend is unavailable. {RETRY_HINT}"),
         });
     }
 
@@ -265,7 +273,11 @@ send_transport = true
         config.audio.output_device = "Missing Output".to_string();
 
         let error = preflight(&config, &inventory()).expect_err("preflight should fail");
-        assert!(error.message.contains("Configured output device 'Missing Output' was not found"));
+        assert!(
+            error
+                .message
+                .contains("Configured output device 'Missing Output' was not found")
+        );
         assert!(error.message.contains(RETRY_HINT));
     }
 
@@ -275,7 +287,11 @@ send_transport = true
         config.audio.input_channel = 2;
 
         let error = preflight(&config, &inventory()).expect_err("preflight should fail");
-        assert!(error.message.contains("Configured input channel 2 is unavailable"));
+        assert!(
+            error
+                .message
+                .contains("Configured input channel 2 is unavailable")
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -7,7 +7,7 @@ use std::str::FromStr;
 
 use crate::ltc::Timecode;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Generate,
@@ -81,6 +81,15 @@ impl<'de> Deserialize<'de> for Fps {
     }
 }
 
+impl Serialize for Fps {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(self.as_f64())
+    }
+}
+
 fn parse_fps(value: f64) -> Result<Fps, String> {
     match value {
         24.0 => Ok(Fps::Fps24),
@@ -93,7 +102,7 @@ fn parse_fps(value: f64) -> Result<Fps, String> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub mode: Mode,
     pub audio: AudioConfig,
@@ -119,6 +128,16 @@ impl AppConfig {
         let config: AppConfig = toml::from_str(raw).map_err(ConfigError::Parse)?;
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        self.validate()?;
+        let path = path.as_ref();
+        let raw = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
+        fs::write(path, raw).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -152,18 +171,8 @@ impl AppConfig {
             -500.0,
             500.0,
         )?;
-        validate_range(
-            "latency_ms.decoder",
-            self.latency_ms.decoder,
-            -500.0,
-            500.0,
-        )?;
-        validate_range(
-            "latency_ms.manual",
-            self.latency_ms.manual,
-            -2000.0,
-            2000.0,
-        )?;
+        validate_range("latency_ms.decoder", self.latency_ms.decoder, -500.0, 500.0)?;
+        validate_range("latency_ms.manual", self.latency_ms.manual, -2000.0, 2000.0)?;
 
         if self.audio.sample_rate != 44_100 && self.audio.sample_rate != 48_000 {
             return Err(ConfigError::Validation {
@@ -182,10 +191,11 @@ impl AppConfig {
             });
         }
 
-        let timecode = Timecode::from_str(&self.timecode.start).map_err(|source| ConfigError::Validation {
-            field: "timecode.start",
-            message: source.to_string(),
-        })?;
+        let timecode =
+            Timecode::from_str(&self.timecode.start).map_err(|source| ConfigError::Validation {
+                field: "timecode.start",
+                message: source.to_string(),
+            })?;
 
         if timecode.frames >= self.timecode.ltc_fps.frame_count_base() {
             return Err(ConfigError::Validation {
@@ -208,6 +218,43 @@ impl AppConfig {
     }
 }
 
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Generate,
+            audio: AudioConfig {
+                sample_rate: 44_100,
+                input_device: String::new(),
+                input_channel: 0,
+                output_device: String::new(),
+                output_channel: 0,
+            },
+            timecode: TimecodeConfig {
+                start: "01:00:00:00".to_string(),
+                ltc_fps: Fps::Fps30,
+            },
+            tempo: TempoConfig {
+                ref_bpm: 128.0,
+                ref_fps: Fps::Fps30,
+                smoothing_alpha: 0.15,
+            },
+            decode: DecodeConfig::default(),
+            latency_ms: LatencyConfig {
+                audio_output: 5.0,
+                tape_path: 20.0,
+                decoder: 10.0,
+                manual: 0.0,
+            },
+            midi: MidiConfig {
+                port_name: "TapeSync MIDI Out".to_string(),
+                send_mtc: false,
+                send_clock: true,
+                send_transport: true,
+            },
+        }
+    }
+}
+
 fn validate_range(field: &'static str, value: f64, min: f64, max: f64) -> Result<(), ConfigError> {
     if value < min || value > max {
         return Err(ConfigError::Validation {
@@ -219,7 +266,7 @@ fn validate_range(field: &'static str, value: f64, min: f64, max: f64) -> Result
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AudioConfig {
     pub sample_rate: u32,
     pub input_device: String,
@@ -228,20 +275,20 @@ pub struct AudioConfig {
     pub output_channel: u16,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TimecodeConfig {
     pub start: String,
     pub ltc_fps: Fps,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TempoConfig {
     pub ref_bpm: f64,
     pub ref_fps: Fps,
     pub smoothing_alpha: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DecodeConfig {
     pub fps_estimate_window_frames: usize,
     pub dropout_reset_windows: u32,
@@ -256,7 +303,7 @@ impl Default for DecodeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LatencyConfig {
     pub audio_output: f64,
     pub tape_path: f64,
@@ -264,7 +311,7 @@ pub struct LatencyConfig {
     pub manual: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MidiConfig {
     pub port_name: String,
     pub send_mtc: bool,
@@ -279,6 +326,7 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     Parse(toml::de::Error),
+    Serialize(toml::ser::Error),
     Validation {
         field: &'static str,
         message: String,
@@ -290,6 +338,7 @@ impl fmt::Display for ConfigError {
         match self {
             Self::Io { path, source } => write!(f, "failed to read config at {path}: {source}"),
             Self::Parse(source) => write!(f, "failed to parse config: {source}"),
+            Self::Serialize(source) => write!(f, "failed to serialize config: {source}"),
             Self::Validation { field, message } => {
                 write!(f, "config validation failed for {field}: {message}")
             }
@@ -365,9 +414,16 @@ send_transport = true
 
     #[test]
     fn rejects_decode_window_size_below_minimum() {
-        let raw = valid_config().replace("fps_estimate_window_frames = 12", "fps_estimate_window_frames = 0");
+        let raw = valid_config().replace(
+            "fps_estimate_window_frames = 12",
+            "fps_estimate_window_frames = 0",
+        );
         let error = AppConfig::from_toml_str(&raw).expect_err("window size should be rejected");
-        assert!(error.to_string().contains("decode.fps_estimate_window_frames"));
+        assert!(
+            error
+                .to_string()
+                .contains("decode.fps_estimate_window_frames")
+        );
     }
 
     #[test]
@@ -379,7 +435,8 @@ send_transport = true
 
     #[test]
     fn rejects_empty_midi_port_name() {
-        let raw = valid_config().replace("port_name = \"TapeSync MIDI Out\"", "port_name = \"   \"");
+        let raw =
+            valid_config().replace("port_name = \"TapeSync MIDI Out\"", "port_name = \"   \"");
         let error = AppConfig::from_toml_str(&raw).expect_err("empty port name should fail");
         assert!(error.to_string().contains("midi.port_name"));
     }
@@ -398,5 +455,17 @@ send_transport = true
 
         assert_eq!(config.audio.sample_rate, 44100);
         assert_eq!(config.timecode.ltc_fps.as_f64(), 30.0);
+    }
+
+    #[test]
+    fn saved_config_round_trips() {
+        let config = AppConfig::from_toml_str(valid_config()).expect("config should parse");
+        let serialized = toml::to_string_pretty(&config).expect("config should serialize");
+        let restored = AppConfig::from_toml_str(&serialized).expect("saved config should parse");
+
+        assert_eq!(restored.mode, Mode::Generate);
+        assert_eq!(restored.audio.output_device, "Output A");
+        assert_eq!(restored.audio.output_channel, 1);
+        assert_eq!(restored.timecode.ltc_fps, Fps::Fps30);
     }
 }

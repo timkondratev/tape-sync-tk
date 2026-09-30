@@ -34,6 +34,26 @@ TapeSync runs in one mode at a time.
 
 - Generate mode: produce LTC audio to selected output device/channel.
 - Decode mode: read LTC from selected input device/channel and emit MIDI.
+- Settings: edit persistent application and audio routing settings without starting an audio stream.
+
+### 3.1 Text UI (MVP)
+
+Normal startup opens a terminal menu with `Generate`, `Decode`, `Settings`, and `Quit` choices. Users must not need to edit the TOML settings file by hand.
+
+- Menus react to each key press immediately; Enter is not required for numbered choices.
+- Arrow keys and Enter are also supported for lists longer than nine items.
+- The startup screen displays the current mode, sample rate, input route, and output route.
+- Generate starts immediately with the saved output device/channel when that route is still available.
+- Decode starts immediately with the saved input device/channel when that route is still available.
+- Settings allows input routing, output routing, and sample rate to be changed, then returns to mode selection.
+- Device lists contain only currently available devices that support the required direction.
+- `Esc` or `b` moves back from settings, device/channel selection, and a running mode. Returning from a running mode stops its audio and MIDI resources cleanly.
+- `q` or Ctrl-C exits from any screen.
+- An empty device list produces a clear direction-specific error.
+- Choices are validated and persisted automatically to the configured settings path before startup or exit.
+- Saved routes remain selected across launches while the named device and channel remain available. A missing saved route falls back to the first available route for that direction.
+- A missing or unreadable settings file falls back to built-in defaults so it can be repaired through the text UI.
+- `--config <path>` selects the persistence path; it does not bypass the text UI.
 
 Mode switching behavior:
 
@@ -65,7 +85,7 @@ These defaults remove under-specification and should be implemented unless chang
 - Latency units: milliseconds, signed where noted.
 - SPP mapping anchor (MVP): timecode `01:00:00:00` maps to bar 1 beat 1.
 - Reverse-direction behavior (MVP): decoder may report reverse, but transport/clock emission ignores reverse playback and does not chase while reverse is detected.
-- Device resolution behavior on startup failure: if configured audio/MIDI device name/channel is unavailable, emit a clear related error and prompt the user to try again after fixing device availability/config.
+- Device resolution behavior on startup failure: if an audio/MIDI device or channel becomes unavailable after selection, emit a clear related error and prompt the user to try again from the text UI.
 
 Validation defaults (MVP):
 
@@ -314,6 +334,11 @@ MIDI side effects:
 9. Clock precision contract
 - Verify scheduler meets interval error, jitter, and drift targets under steady-tempo simulation.
 
+10. Text UI
+- Verify Generate and Decode show only devices that support the required direction.
+- Verify device/channel choices update the in-memory configuration and invalid choices are retried.
+- Verify serialized settings round-trip through TOML.
+
 ## 11. Open Items (Explicitly Deferred)
 
 - Drop-frame support details for `29.97 DF`.
@@ -369,6 +394,7 @@ Requirement-to-test traceability (minimum):
 - Startup device resolution behavior -> T-10 unavailable device/channel startup error and retry prompt.
 - Reverse-ignore policy -> T-11 reverse detection suppresses chase output in MVP.
 - Clock precision contract -> T-12 interval/jitter/drift checks under steady tempo.
+- Text UI and persistence -> T-13 mode/device/channel selection and settings round-trip tests.
 
 CI expectations:
 

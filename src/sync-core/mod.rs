@@ -51,7 +51,11 @@ impl<P: MidiTransport> SyncEngine<P> {
             self.midi.send_stop()?;
         }
 
-        if self.send_clock && forward && update.lock_status == LockStatus::Locked && update.emit_clock_tick {
+        if self.send_clock
+            && forward
+            && update.lock_status == LockStatus::Locked
+            && update.emit_clock_tick
+        {
             self.midi.send_clock()?;
         }
 
@@ -101,8 +105,8 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
             .decoded_frame_count
             .saturating_sub(self.last_decoded_frame_count);
         self.last_decoded_frame_count = status.decoded_frame_count;
-        let lock_acquisition = self.last_lock_status != LockStatus::Locked
-            && status.lock_status == LockStatus::Locked;
+        let lock_acquisition =
+            self.last_lock_status != LockStatus::Locked && status.lock_status == LockStatus::Locked;
 
         if status.direction == PlaybackDirection::Reverse {
             self.clock_accumulator = 0.0;
@@ -161,8 +165,7 @@ impl<P: MidiTransport> DecodeSyncBridge<P> {
         } else {
             30.0
         };
-        let seconds = timecode_seconds(timecode, fps)
-            + self.latency_ms / 1000.0
+        let seconds = timecode_seconds(timecode, fps) + self.latency_ms / 1000.0
             - timecode_seconds(self.anchor_timecode, fps);
         let beats = seconds.max(0.0) * self.ref_bpm / 60.0;
         let spp = (beats * 4.0).floor();
@@ -220,7 +223,9 @@ mod tests {
         SyncEngine::new(
             MidiOutputPort::new(
                 "TapeSync MIDI Out".to_string(),
-                FakeConnection { messages: Vec::new() },
+                FakeConnection {
+                    messages: Vec::new(),
+                },
             ),
             true,
             true,
@@ -241,7 +246,10 @@ mod tests {
             .expect("lock update should send transport");
 
         let connection = engine.into_midi().into_inner();
-        assert_eq!(connection.messages, vec![vec![0xF2, 0x34, 0x24], vec![0xFB]]);
+        assert_eq!(
+            connection.messages,
+            vec![vec![0xF2, 0x34, 0x24], vec![0xFB]]
+        );
     }
 
     #[test]
@@ -258,7 +266,10 @@ mod tests {
             .expect("lock update should send transport");
 
         let connection = engine.into_midi().into_inner();
-        assert_eq!(connection.messages, vec![vec![0xF2, 0x00, 0x00], vec![0xFA]]);
+        assert_eq!(
+            connection.messages,
+            vec![vec![0xF2, 0x00, 0x00], vec![0xFA]]
+        );
     }
 
     #[test]
@@ -306,7 +317,10 @@ mod tests {
             .expect("reverse update should be suppressed, not fail");
 
         let connection = engine.into_midi().into_inner();
-        assert_eq!(connection.messages, vec![vec![0xF2, 0x00, 0x00], vec![0xFA], vec![0xF8]]);
+        assert_eq!(
+            connection.messages,
+            vec![vec![0xF2, 0x00, 0x00], vec![0xFA], vec![0xF8]]
+        );
     }
 
     #[test]
@@ -323,26 +337,33 @@ mod tests {
             500.0,
         );
 
-        bridge.handle_status_result(&DecodeStatus {
-            lock_status: LockStatus::Locked,
-            direction: PlaybackDirection::Forward,
-            edge_count: 0,
-            consecutive_valid_windows: 8,
-            consecutive_invalid_windows: 0,
-            current_timecode: Some(Timecode {
-                hours: 1,
-                minutes: 0,
-                seconds: 0,
-                frames: 15,
-            }),
-            decoded_frame_count: 15,
-            measured_fps: Some(30.0),
-            smoothed_tempo_bpm: Some(120.0),
-        }).expect("bridge should emit updates");
+        bridge
+            .handle_status_result(&DecodeStatus {
+                lock_status: LockStatus::Locked,
+                direction: PlaybackDirection::Forward,
+                edge_count: 0,
+                consecutive_valid_windows: 8,
+                consecutive_invalid_windows: 0,
+                current_timecode: Some(Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 15,
+                }),
+                decoded_frame_count: 15,
+                measured_fps: Some(30.0),
+                smoothed_tempo_bpm: Some(120.0),
+            })
+            .expect("bridge should emit updates");
 
         let connection = bridge.into_engine().into_midi().into_inner();
         assert_eq!(connection.messages.first(), Some(&vec![0xF2, 0x08, 0x00]));
-        assert!(connection.messages.iter().any(|message| message == &vec![0xF8]));
+        assert!(
+            connection
+                .messages
+                .iter()
+                .any(|message| message == &vec![0xF8])
+        );
     }
 
     #[test]
@@ -359,22 +380,24 @@ mod tests {
             500.0,
         );
 
-        bridge.handle_status_result(&DecodeStatus {
-            lock_status: LockStatus::Locked,
-            direction: PlaybackDirection::Reverse,
-            edge_count: 0,
-            consecutive_valid_windows: 8,
-            consecutive_invalid_windows: 0,
-            current_timecode: Some(Timecode {
-                hours: 1,
-                minutes: 0,
-                seconds: 0,
-                frames: 10,
-            }),
-            decoded_frame_count: 10,
-            measured_fps: Some(30.0),
-            smoothed_tempo_bpm: Some(120.0),
-        }).expect("reverse update should be suppressed");
+        bridge
+            .handle_status_result(&DecodeStatus {
+                lock_status: LockStatus::Locked,
+                direction: PlaybackDirection::Reverse,
+                edge_count: 0,
+                consecutive_valid_windows: 8,
+                consecutive_invalid_windows: 0,
+                current_timecode: Some(Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 10,
+                }),
+                decoded_frame_count: 10,
+                measured_fps: Some(30.0),
+                smoothed_tempo_bpm: Some(120.0),
+            })
+            .expect("reverse update should be suppressed");
 
         let connection = bridge.into_engine().into_midi().into_inner();
         assert!(connection.messages.is_empty());

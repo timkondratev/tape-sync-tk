@@ -74,24 +74,7 @@ After this, you can run tape-sync-tk from your shell if Cargo bin is on PATH.
 
 ## Quick Start
 
-### 1. Create your config
-
-Copy the sample config and edit device names/channels:
-
-```bash
-cp tape-sync.example.toml tape-sync.toml
-```
-
-### 2. Set audio and mode
-
-In tape-sync.toml:
-
-- Set mode to generate or decode.
-- Set sample_rate to 44100 or 48000.
-- Set input_device/output_device to exact system device names.
-- Set input_channel/output_channel as zero-based indices.
-
-### 3. Run
+### Run
 
 Using default config path:
 
@@ -104,6 +87,10 @@ Using custom config path:
 ```bash
 cargo run -- --config path/to/your-config.toml
 ```
+
+The terminal menu lets you select Generate, Decode, or Settings. Choices react immediately to number keys; arrow keys and Enter also work. Use `Esc` or `b` to go back from settings or a running mode, and `q` or Ctrl-C to quit.
+
+The startup screen shows the current audio routes and sample rate. Generate and Decode reuse the saved device/channel without asking again while that route remains available. Change routing under Settings, where devices are listed from those currently available on your system. Settings are saved automatically to `tape-sync.toml`, or to the path passed with `--config`.
 
 Stop with Ctrl-C.
 
@@ -143,11 +130,9 @@ Use a Tascam PortaStudio as the transport master and have Ableton Live chase tap
 
 Purpose: output LTC audio to a selected audio output/channel so you can record timecode onto tape.
 
-1. Set mode = "generate".
-2. Route output channel to the tape track you use for timecode.
-3. Set timecode.start and timecode.ltc_fps for your session.
-4. Run the app.
-5. Record the generated LTC onto tape.
+1. Run the app and select Generate.
+2. Select the audio output device and channel routed to your tape track.
+3. Record the generated LTC onto tape.
 
 Tips:
 
@@ -158,17 +143,17 @@ Tips:
 
 Purpose: read LTC from tape playback and emit MIDI sync for DAW/hardware.
 
-1. Set mode = "decode".
-2. Route LTC playback from tape into configured input device/channel.
+1. Route LTC playback from tape into an audio input.
+2. Run the app, select Decode, then select that input device and channel.
 3. In your DAW, select the configured virtual MIDI port name.
 4. Enable external sync/clock receive in DAW.
-5. Start Tape Sync TK, then start tape playback.
+5. Start tape playback.
 
 In decode mode, the app shows a live status line with lock state, direction, decoded frames, measured fps, and BPM estimate.
 
 ## Configuration Reference
 
-The app reads TOML config. Default path is tape-sync.toml.
+The app stores settings as TOML at `tape-sync.toml` by default. The text UI manages the settings required for normal use, so hand editing is not required. Values not yet exposed by the basic UI retain their saved values or built-in defaults.
 
 Example shape:
 

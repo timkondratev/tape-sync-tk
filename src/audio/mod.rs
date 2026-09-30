@@ -114,11 +114,21 @@ pub fn supports_input(device: &Device, sample_rate: u32, channel: u16) -> Result
     Ok(())
 }
 
-pub fn supports_output(device: &Device, sample_rate: u32, channel: u16) -> Result<(), RuntimeError> {
+pub fn supports_output(
+    device: &Device,
+    sample_rate: u32,
+    channel: u16,
+) -> Result<(), RuntimeError> {
     let ranges = device
         .supported_output_configs()
         .map_err(|source| RuntimeError::AudioConfiguration(source.to_string()))?;
-    select_supported_config(ranges, sample_rate, channel, "output", &device_name(device)?)?;
+    select_supported_config(
+        ranges,
+        sample_rate,
+        channel,
+        "output",
+        &device_name(device)?,
+    )?;
     Ok(())
 }
 
@@ -147,7 +157,10 @@ where
         })
 }
 
-fn supported_to_stream_config(range: &SupportedStreamConfigRange, sample_rate: u32) -> StreamConfig {
+fn supported_to_stream_config(
+    range: &SupportedStreamConfigRange,
+    sample_rate: u32,
+) -> StreamConfig {
     StreamConfig {
         channels: range.channels(),
         sample_rate: SampleRate(sample_rate),
@@ -249,10 +262,8 @@ fn build_output_stream(
     generator_request: GeneratorRequest<'_>,
 ) -> Result<Stream, RuntimeError> {
     let err_fn = |error| eprintln!("audio output stream error: {error}");
-    let mut generator =
-        LtcGenerator::new(generator_request, config.sample_rate.0).map_err(|source| {
-            RuntimeError::Ltc(source.to_string())
-        })?;
+    let mut generator = LtcGenerator::new(generator_request, config.sample_rate.0)
+        .map_err(|source| RuntimeError::Ltc(source.to_string()))?;
     let channel_count = config.channels as usize;
     let target_channel = channel as usize;
 
@@ -316,7 +327,12 @@ fn process_f32_input(
     decode_status_handler: Option<&SharedDecodeStatusHandler>,
 ) {
     let selected = extract_f32_channel(data, channel_count, target_channel);
-    update_decode_status(decode_status, decode_monitor, decode_status_handler, &selected);
+    update_decode_status(
+        decode_status,
+        decode_monitor,
+        decode_status_handler,
+        &selected,
+    );
 }
 
 fn process_i16_input(
@@ -332,7 +348,12 @@ fn process_i16_input(
         .filter_map(|frame| frame.get(target_channel).copied())
         .map(|sample| sample as f32 / i16::MAX as f32)
         .collect::<Vec<_>>();
-    update_decode_status(decode_status, decode_monitor, decode_status_handler, &selected);
+    update_decode_status(
+        decode_status,
+        decode_monitor,
+        decode_status_handler,
+        &selected,
+    );
 }
 
 fn process_u16_input(
@@ -348,7 +369,12 @@ fn process_u16_input(
         .filter_map(|frame| frame.get(target_channel).copied())
         .map(|sample| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
         .collect::<Vec<_>>();
-    update_decode_status(decode_status, decode_monitor, decode_status_handler, &selected);
+    update_decode_status(
+        decode_status,
+        decode_monitor,
+        decode_status_handler,
+        &selected,
+    );
 }
 
 fn update_decode_status(
@@ -445,7 +471,13 @@ mod tests {
         render_f32_output(&mut buffer, 2, 1, &mut generator);
 
         assert!(buffer.iter().step_by(2).all(|sample| *sample == 0.0));
-        assert!(buffer.iter().skip(1).step_by(2).any(|sample| *sample != 0.0));
+        assert!(
+            buffer
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .any(|sample| *sample != 0.0)
+        );
     }
 
     #[test]

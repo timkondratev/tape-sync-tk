@@ -53,9 +53,7 @@ impl<C> fmt::Debug for MidiOutputPort<C> {
 
 impl<C: MidiSink> MidiOutputPort<C> {
     pub fn send(&mut self, message: &[u8]) -> Result<(), RuntimeError> {
-        self.connection
-            .send(message)
-            .map_err(RuntimeError::Midi)
+        self.connection.send(message).map_err(RuntimeError::Midi)
     }
 
     pub fn send_start(&mut self) -> Result<(), RuntimeError> {
@@ -81,7 +79,11 @@ impl<C: MidiSink> MidiOutputPort<C> {
             )));
         }
 
-        self.send(&[0xF2, (position & 0x7F) as u8, ((position >> 7) & 0x7F) as u8])
+        self.send(&[
+            0xF2,
+            (position & 0x7F) as u8,
+            ((position >> 7) & 0x7F) as u8,
+        ])
     }
 }
 
@@ -111,7 +113,9 @@ where
 }
 
 #[cfg(unix)]
-pub fn create_virtual_output(port_name: &str) -> Result<MidiOutputPort<MidiOutputConnection>, RuntimeError> {
+pub fn create_virtual_output(
+    port_name: &str,
+) -> Result<MidiOutputPort<MidiOutputConnection>, RuntimeError> {
     let midi_output = midir::MidiOutput::new("TapeSync runtime init")
         .map_err(|source| RuntimeError::Midi(source.to_string()))?;
     let connection = midi_output
@@ -122,7 +126,9 @@ pub fn create_virtual_output(port_name: &str) -> Result<MidiOutputPort<MidiOutpu
 }
 
 #[cfg(not(unix))]
-pub fn create_virtual_output(_port_name: &str) -> Result<MidiOutputPort<MidiOutputConnection>, RuntimeError> {
+pub fn create_virtual_output(
+    _port_name: &str,
+) -> Result<MidiOutputPort<MidiOutputConnection>, RuntimeError> {
     Err(RuntimeError::Midi(
         "virtual MIDI output is unsupported on this platform".to_string(),
     ))
@@ -148,7 +154,9 @@ mod tests {
     fn preserves_port_name() {
         let port = MidiOutputPort::new(
             "TapeSync MIDI Out".to_string(),
-            FakeConnection { messages: Vec::new() },
+            FakeConnection {
+                messages: Vec::new(),
+            },
         );
         assert_eq!(port.port_name, "TapeSync MIDI Out");
     }
@@ -157,16 +165,25 @@ mod tests {
     fn exposes_inner_connection() {
         let port = MidiOutputPort::new(
             "TapeSync MIDI Out".to_string(),
-            FakeConnection { messages: Vec::new() },
+            FakeConnection {
+                messages: Vec::new(),
+            },
         );
-        assert_eq!(port.into_inner(), FakeConnection { messages: Vec::new() });
+        assert_eq!(
+            port.into_inner(),
+            FakeConnection {
+                messages: Vec::new()
+            }
+        );
     }
 
     #[test]
     fn encodes_transport_and_clock_bytes() {
         let mut port = MidiOutputPort::new(
             "TapeSync MIDI Out".to_string(),
-            FakeConnection { messages: Vec::new() },
+            FakeConnection {
+                messages: Vec::new(),
+            },
         );
 
         port.send_start().expect("start should send");
@@ -175,14 +192,19 @@ mod tests {
         port.send_clock().expect("clock should send");
 
         let connection = port.into_inner();
-        assert_eq!(connection.messages, vec![vec![0xFA], vec![0xFB], vec![0xFC], vec![0xF8]]);
+        assert_eq!(
+            connection.messages,
+            vec![vec![0xFA], vec![0xFB], vec![0xFC], vec![0xF8]]
+        );
     }
 
     #[test]
     fn encodes_song_position_pointer_bytes() {
         let mut port = MidiOutputPort::new(
             "TapeSync MIDI Out".to_string(),
-            FakeConnection { messages: Vec::new() },
+            FakeConnection {
+                messages: Vec::new(),
+            },
         );
 
         port.send_song_position_pointer(0x1234)

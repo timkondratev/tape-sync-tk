@@ -1,9 +1,9 @@
 use crate::config::Fps;
+use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::fmt;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 const LTC_PEAK_AMPLITUDE: f32 = 0.501_187_2;
 const SYNC_WORD: [bool; 16] = [
@@ -151,7 +151,8 @@ impl FromStr for Timecode {
 }
 
 fn parse_component(part: Option<&str>) -> Result<u8, LtcError> {
-    let value = part.ok_or_else(|| LtcError::InvalidTimecodeFormat("missing component".to_string()))?;
+    let value =
+        part.ok_or_else(|| LtcError::InvalidTimecodeFormat("missing component".to_string()))?;
     if value.len() != 2 {
         return Err(LtcError::InvalidTimecodeFormat(value.to_string()));
     }
@@ -680,7 +681,9 @@ fn decode_timecode(bits: [bool; 80], fps: Fps) -> Result<Timecode, LtcError> {
     let hours = hour_units + hour_tens * 10;
 
     if hours >= 24 || minutes >= 60 || seconds >= 60 {
-        return Err(LtcError::InvalidFrame("decoded BCD fields are out of range".to_string()));
+        return Err(LtcError::InvalidFrame(
+            "decoded BCD fields are out of range".to_string(),
+        ));
     }
 
     if frames >= fps.frame_count_base() {
@@ -960,10 +963,19 @@ mod tests {
     fn lock_tracker_transitions_to_locked_and_back() {
         let mut tracker = LockTracker::new(2, 2);
 
-        assert_eq!(tracker.observe_window(true).lock_status, LockStatus::Locking);
+        assert_eq!(
+            tracker.observe_window(true).lock_status,
+            LockStatus::Locking
+        );
         assert_eq!(tracker.observe_window(true).lock_status, LockStatus::Locked);
-        assert_eq!(tracker.observe_window(false).lock_status, LockStatus::Locked);
-        assert_eq!(tracker.observe_window(false).lock_status, LockStatus::Unlocked);
+        assert_eq!(
+            tracker.observe_window(false).lock_status,
+            LockStatus::Locked
+        );
+        assert_eq!(
+            tracker.observe_window(false).lock_status,
+            LockStatus::Unlocked
+        );
     }
 
     #[test]
@@ -1101,7 +1113,10 @@ mod tests {
             frames: 0,
         };
 
-        assert_eq!(infer_direction(previous, current, Fps::Fps30), PlaybackDirection::Reverse);
+        assert_eq!(
+            infer_direction(previous, current, Fps::Fps30),
+            PlaybackDirection::Reverse
+        );
     }
 
     #[test]

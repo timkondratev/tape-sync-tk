@@ -1,16 +1,18 @@
 use std::env;
 use std::io::{self, Write};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use cpal::traits::DeviceTrait;
+use crossterm::cursor::MoveTo;
+use crossterm::execute;
+use crossterm::terminal::{Clear, ClearType};
 use tape_sync_tk::audio::AudioRuntime;
 use tape_sync_tk::cli::CliArgs;
-use tape_sync_tk::config::{AppConfig, Mode};
+use tape_sync_tk::config::AppConfig;
 use tape_sync_tk::runtime::initialize;
+use tape_sync_tk::startup::SystemInventory;
+use tape_sync_tk::text_ui::{self, KeyPress, MenuAction, RawModeGuard};
 
 fn main() {
     if let Err(error) = run() {
@@ -20,7 +22,9 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let program_name = env::args().next().unwrap_or_else(|| "tape-sync-tk".to_string());
+    let program_name = env::args()
+        .next()
+        .unwrap_or_else(|| "tape-sync-tk".to_string());
     let args = CliArgs::parse_from(env::args())?;
 
     if args.show_help {
@@ -28,90 +32,96 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let config = AppConfig::from_path(&args.config_path)?;
-    let runtime = initialize(&config)?;
+    let mut config = match AppConfig::from_path(&args.config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("warning: {error}; using built-in defaults");
+            AppConfig::default()
+        }
+    };
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    loop {
+        let inventory = SystemInventory::gather()?;
+        match text_ui::run(&mut output, config, &inventory)? {
+            MenuAction::Quit(updated_config) => {
+                updated_config.save_to_path(&args.config_path)?;
+                execute!(output, Clear(ClearType::All), MoveTo(0, 0))?;
+                return Ok(());
+            }
+            MenuAction::Start(updated_config) => config = updated_config,
+        }
 
-    for warning in &runtime.report.warnings {
-        eprintln!("warning: {warning}");
+        config.save_to_path(&args.config_path)?;
+        let runtime = initialize(&config)?;
+        let runtime_action = run_mode(&mut output, &config, &runtime)?;
+        drop(runtime);
+
+        if runtime_action == RuntimeAction::Quit {
+            execute!(output, Clear(ClearType::All), MoveTo(0, 0))?;
+            return Ok(());
+        }
     }
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeAction {
+    Back,
+    Quit,
+}
+
+fn run_mode<W: Write>(
+    output: &mut W,
+    config: &AppConfig,
+    runtime: &tape_sync_tk::runtime::StartupRuntime,
+) -> Result<RuntimeAction, Box<dyn std::error::Error>> {
+    let _raw_mode = RawModeGuard::acquire()?;
     let mode_summary = match &runtime.audio {
         AudioRuntime::Generate { output } => format!(
-            "generate mode using output '{}' channel {} at {} Hz",
+            "Output: {} channel {} at {} Hz",
             output.device.name()?,
             output.channel,
             output.sample_rate
         ),
         AudioRuntime::Decode { input } => format!(
-            "decode mode using input '{}' channel {} at {} Hz",
+            "Input: {} channel {} at {} Hz",
             input.device.name()?,
             input.channel,
             input.sample_rate
         ),
     };
-
-    println!(
-        "startup initialization passed for {:?} mode with total latency {:.2} ms; {mode_summary}",
-        config.mode, runtime.report.total_latency_ms
-    );
-
-    println!("running {:?} mode; press Ctrl-C to stop", config.mode);
-    if matches!(config.mode, Mode::Decode) {
-        wait_for_shutdown_with_status(&runtime)?;
-    } else {
-        wait_for_shutdown()?;
-    }
-
-    println!();
-    drop(runtime);
-    println!("shutdown complete for {:?} mode", config.mode);
-    Ok(())
-}
-
-fn wait_for_shutdown() -> Result<(), Box<dyn std::error::Error>> {
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let handler_flag = Arc::clone(&shutdown_requested);
-
-    ctrlc::set_handler(move || {
-        handler_flag.store(true, Ordering::SeqCst);
-    })?;
-
-    while !shutdown_requested.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(200));
-    }
-
-    Ok(())
-}
-
-fn wait_for_shutdown_with_status(
-    runtime: &tape_sync_tk::runtime::StartupRuntime,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let handler_flag = Arc::clone(&shutdown_requested);
-
-    ctrlc::set_handler(move || {
-        handler_flag.store(true, Ordering::SeqCst);
-    })?;
-
-    let redraw_interval = Duration::from_millis(200);
-    let mut last_draw = Instant::now() - redraw_interval;
     let mut last_status = None;
-    while !shutdown_requested.load(Ordering::SeqCst) {
-        if let Some(status) = runtime.decode_status_snapshot() {
-            let changed = last_status.as_ref() != Some(&status);
-            if changed && last_draw.elapsed() >= redraw_interval {
-                // Clear current line before redrawing to avoid wrapped/leftover text artifacts.
-                print!("\r\x1b[2K{}", render_status_line(&status));
-                io::stdout().flush()?;
-                last_status = Some(status);
-                last_draw = Instant::now();
+    let mut last_draw = Instant::now() - Duration::from_millis(200);
+
+    loop {
+        let status = runtime.decode_status_snapshot();
+        if last_status != status || last_draw.elapsed() >= Duration::from_secs(1) {
+            execute!(output, Clear(ClearType::All), MoveTo(0, 0))?;
+            writeln!(output, "Running {:?}\r", config.mode)?;
+            writeln!(output, "{mode_summary}\r")?;
+            writeln!(
+                output,
+                "Total latency: {:.2} ms\r",
+                runtime.report.total_latency_ms
+            )?;
+            for warning in &runtime.report.warnings {
+                writeln!(output, "Warning: {warning}\r")?;
             }
+            if let Some(status) = &status {
+                writeln!(output, "{}\r", render_status_line(status))?;
+            }
+            writeln!(output, "\rEsc/b: back to menu    q/Ctrl-C: quit\r")?;
+            output.flush()?;
+            last_status = status;
+            last_draw = Instant::now();
         }
 
-        thread::sleep(Duration::from_millis(200));
+        match text_ui::poll_key(Duration::from_millis(100))? {
+            Some(KeyPress::Back) => return Ok(RuntimeAction::Back),
+            Some(KeyPress::Quit) => return Ok(RuntimeAction::Quit),
+            _ => {}
+        }
     }
-
-    Ok(())
 }
 
 fn render_status_line(status: &tape_sync_tk::ltc::DecodeStatus) -> String {
@@ -136,4 +146,3 @@ fn render_status_line(status: &tape_sync_tk::ltc::DecodeStatus) -> String {
         status.consecutive_invalid_windows,
     )
 }
-

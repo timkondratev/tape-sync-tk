@@ -59,7 +59,7 @@ impl CliArgs {
 
     pub fn help_text(program_name: &str) -> String {
         format!(
-            "Usage: {program_name} [--config <path>] [config-path]\n\nOptions:\n  -c, --config <path>  Path to TOML config file\n  -h, --help           Show this help text\n\nDefaults:\n  Config path defaults to {DEFAULT_CONFIG_PATH}\n"
+            "Usage: {program_name} [--config <path>] [config-path]\n\nOpens an interactive menu for Generate, Decode, and Settings.\nSelections are saved automatically.\n\nOptions:\n  -c, --config <path>  Path used to store settings\n  -h, --help           Show this help text\n\nDefaults:\n  Settings path defaults to {DEFAULT_CONFIG_PATH}\n"
         )
     }
 }
@@ -93,8 +93,8 @@ mod tests {
 
     #[test]
     fn defaults_to_standard_config_path() {
-        let parsed = CliArgs::parse_from(args(&["tape-sync-tk"]))
-            .expect("default parsing should succeed");
+        let parsed =
+            CliArgs::parse_from(args(&["tape-sync-tk"])).expect("default parsing should succeed");
 
         assert_eq!(parsed.config_path, "tape-sync.toml");
         assert!(!parsed.show_help);

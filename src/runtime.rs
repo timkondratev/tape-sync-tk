@@ -1,6 +1,8 @@
-use crate::config::{AppConfig, Mode};
 use crate::audio::{self, AudioEndpoint, AudioRuntime};
-use crate::ltc::{DecodeRequest, DecodeStatus, GeneratorRequest, SharedDecodeStatusHandler, Timecode};
+use crate::config::{AppConfig, Mode};
+use crate::ltc::{
+    DecodeRequest, DecodeStatus, GeneratorRequest, SharedDecodeStatusHandler, Timecode,
+};
 use crate::midi::{self, MidiOutputPort, MidiTransport};
 use crate::startup::{StartupReport, SystemInventory, preflight};
 use crate::sync_core::{DecodeSyncBridge, SyncEngine};
@@ -155,7 +157,8 @@ pub trait RuntimeBackend {
         request: AudioRequest<'_>,
         generator_request: GeneratorRequest<'_>,
     ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError>;
-    fn create_virtual_midi_output(&self, port_name: &str) -> Result<Self::MidiHandle, RuntimeError>;
+    fn create_virtual_midi_output(&self, port_name: &str)
+    -> Result<Self::MidiHandle, RuntimeError>;
 }
 
 pub struct SystemBackend;
@@ -189,10 +192,18 @@ impl RuntimeBackend for SystemBackend {
     ) -> Result<AudioEndpoint<Self::AudioHandle, Self::StreamHandle>, RuntimeError> {
         let host = cpal::default_host();
         let device = find_device(&host, request.device_name)?;
-        audio::open_output_stream(device, request.sample_rate, request.channel, generator_request)
+        audio::open_output_stream(
+            device,
+            request.sample_rate,
+            request.channel,
+            generator_request,
+        )
     }
 
-    fn create_virtual_midi_output(&self, port_name: &str) -> Result<Self::MidiHandle, RuntimeError> {
+    fn create_virtual_midi_output(
+        &self,
+        port_name: &str,
+    ) -> Result<Self::MidiHandle, RuntimeError> {
         midi::create_virtual_output(port_name)
     }
 }
@@ -237,13 +248,22 @@ impl fmt::Display for RuntimeError {
                 write!(f, "failed to inspect audio device capabilities: {source}")
             }
             Self::AudioStream(source) => {
-                write!(f, "failed to open or start audio stream: {source}. {RETRY_HINT}")
+                write!(
+                    f,
+                    "failed to open or start audio stream: {source}. {RETRY_HINT}"
+                )
             }
             Self::Ltc(source) => {
-                write!(f, "failed to initialize LTC generator: {source}. {RETRY_HINT}")
+                write!(
+                    f,
+                    "failed to initialize LTC generator: {source}. {RETRY_HINT}"
+                )
             }
             Self::MissingAudioDevice(name) => {
-                write!(f, "configured audio device '{name}' was not found during runtime initialization. {RETRY_HINT}")
+                write!(
+                    f,
+                    "configured audio device '{name}' was not found during runtime initialization. {RETRY_HINT}"
+                )
             }
             Self::UnsupportedAudioConfiguration {
                 direction,
@@ -256,7 +276,10 @@ impl fmt::Display for RuntimeError {
                     "configured {direction} device '{device_name}' does not support sample rate {sample_rate} on channel {channel}. {RETRY_HINT}"
                 )
             }
-            Self::Midi(source) => write!(f, "failed to initialize MIDI output: {source}. {RETRY_HINT}"),
+            Self::Midi(source) => write!(
+                f,
+                "failed to initialize MIDI output: {source}. {RETRY_HINT}"
+            ),
         }
     }
 }
@@ -332,14 +355,19 @@ mod tests {
             })
         }
 
-        fn create_virtual_midi_output(&self, port_name: &str) -> Result<Self::MidiHandle, RuntimeError> {
+        fn create_virtual_midi_output(
+            &self,
+            port_name: &str,
+        ) -> Result<Self::MidiHandle, RuntimeError> {
             if self.fail_midi {
                 return Err(RuntimeError::Midi("backend unavailable".to_string()));
             }
 
             Ok(MidiOutputPort::new(
                 port_name.to_string(),
-                FakeMidiConnection { messages: Vec::new() },
+                FakeMidiConnection {
+                    messages: Vec::new(),
+                },
             ))
         }
     }
@@ -449,9 +477,11 @@ send_transport = true
         )
         .expect_err("runtime should fail");
 
-        assert!(error
-            .to_string()
-            .contains("does not support sample rate 44100 on channel 0"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not support sample rate 44100 on channel 0")
+        );
     }
 
     #[test]
@@ -466,7 +496,11 @@ send_transport = true
         )
         .expect_err("midi init should fail");
 
-        assert!(error.to_string().contains("failed to initialize MIDI output"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to initialize MIDI output")
+        );
     }
 
     #[test]
@@ -504,7 +538,10 @@ send_transport = true
 
         match &runtime.audio {
             AudioRuntime::Decode { input } => {
-                let decode_status = input.decode_status.as_ref().expect("decode status should exist");
+                let decode_status = input
+                    .decode_status
+                    .as_ref()
+                    .expect("decode status should exist");
                 *decode_status.lock().expect("status lock should succeed") = synthesized_status;
             }
             AudioRuntime::Generate { .. } => panic!("expected decode runtime"),
